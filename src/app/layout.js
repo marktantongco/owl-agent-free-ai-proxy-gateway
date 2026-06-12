@@ -1,7 +1,6 @@
-import type { Metadata } from 'next'
 import './globals.css'
 
-export const metadata: Metadata = {
+export const metadata = {
   title: 'OWL-AGENT — Free AI Proxy Gateway | Unified Synergy Installer v7.0',
   description: 'Free AI Proxy Gateway — One gateway for Antigravity, Claude, OpenCode, Copilot, Kiro & Hermes. Zero cost, open source, Podman-native. Optimized for Linux Ubuntu 8GB RAM.',
   keywords: 'AI proxy, free AI gateway, Antigravity, Claude, OpenCode, Copilot, Kiro, Hermes, proxy gateway, open source AI, Podman, Linux, Ubuntu, MCP server, circuit breaker',
@@ -24,7 +23,7 @@ export const metadata: Metadata = {
   alternates: { canonical: 'https://owl-agent-free-ai-proxy-gateway.vercel.app' },
 }
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+export default function RootLayout({ children }) {
   return (
     <html lang="en">
       <head>
