@@ -1,8 +1,5 @@
 {
   "buildCommand": "npm run build",
   "outputDirectory": "out",
-  "framework": "nextjs",
-  "env": {
-    "AI_GATEWAY_API_KEY": "@ai_gateway_api_key"
-  }
+  "framework": "nextjs"
 }
