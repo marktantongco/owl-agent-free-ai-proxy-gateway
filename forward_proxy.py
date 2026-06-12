@@ -1,0 +1,1149 @@
+#!/usr/bin/env python3
+"""
+OWL-AGENT Forward Proxy v3.0
+=============================
+
+Production HTTP/HTTPS forward proxy with Auto-Tuner, Mesh Sync,
+and Predictive Circuit Breaker.
+
+Supported AI Providers:
+    - Antigravity  (fast, unlimited free-tier)
+    - Claude       (rate-limited free-tier)
+    - OpenCode     (community keys)
+    - Copilot      (GitHub Copilot integration)
+    - Kiro         (developer tokens)
+    - Hermes       (billing proxy integration)
+
+Environment Variables:
+    OWL_PROXY_HOST        - Bind address (default: 127.0.0.1)
+    OWL_PROXY_PORT        - Bind port (default: 60000)
+    OWL_MAX_CONNECTIONS   - Max concurrent connections (default: 5)
+    OWL_CACHE_MAX_ENTRIES - Max DNS/cache entries (default: 200)
+    OWL_CONNECT_TIMEOUT   - CONNECT timeout seconds (default: 15)
+    OWL_PROXY_TIMEOUT     - General proxy timeout seconds (default: 20)
+    UPSTREAM_PROXY        - Upstream proxy URL, e.g. http://127.0.0.1:7890
+    OWL_ENABLE_MESH       - Enable mesh sync (default: false)
+    OWL_MESH_PORT         - Mesh UDP port (default: 42100)
+    OWL_ENRICH_ENABLED    - Enable request enrichment (default: false)
+
+Usage:
+    python forward_proxy.py
+"""
+
+from __future__ import annotations
+
+import asyncio
+import enum
+import json
+import logging
+import os
+import signal
+import socket
+import struct
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("owl-proxy")
+
+# ---------------------------------------------------------------------------
+# Environment configuration
+# ---------------------------------------------------------------------------
+OWL_PROXY_HOST: str = os.getenv("OWL_PROXY_HOST", "127.0.0.1")
+OWL_PROXY_PORT: int = int(os.getenv("OWL_PROXY_PORT", "60000"))
+OWL_MAX_CONNECTIONS: int = int(os.getenv("OWL_MAX_CONNECTIONS", "5"))
+OWL_CACHE_MAX_ENTRIES: int = int(os.getenv("OWL_CACHE_MAX_ENTRIES", "200"))
+OWL_CONNECT_TIMEOUT: int = int(os.getenv("OWL_CONNECT_TIMEOUT", "15"))
+OWL_PROXY_TIMEOUT: int = int(os.getenv("OWL_PROXY_TIMEOUT", "20"))
+UPSTREAM_PROXY: str = os.getenv("UPSTREAM_PROXY", "")
+OWL_ENABLE_MESH: bool = os.getenv("OWL_ENABLE_MESH", "false").lower() in ("true", "1", "yes")
+OWL_MESH_PORT: int = int(os.getenv("OWL_MESH_PORT", "42100"))
+OWL_ENRICH_ENABLED: bool = os.getenv("OWL_ENRICH_ENABLED", "false").lower() in ("true", "1", "yes")
+
+# ---------------------------------------------------------------------------
+# Provider routing constants
+# ---------------------------------------------------------------------------
+PROVIDERS: Dict[str, Dict[str, Any]] = {
+    "antigravity": {
+        "domains": ["antigravity.dev", "api.antigravity.dev"],
+        "bypass": True,
+        "priority": 1,
+    },
+    "claude": {
+        "domains": ["anthropic.com", "api.anthropic.com"],
+        "bypass": True,
+        "priority": 2,
+    },
+    "opencode": {
+        "domains": ["opencode.dev", "opencode.ai", "api.opencode.dev", "api.opencode.ai"],
+        "bypass": True,
+        "priority": 3,
+    },
+    "copilot": {
+        "domains": ["copilot.ai", "api.githubcopilot.com"],
+        "bypass": True,
+        "priority": 4,
+    },
+    "kiro": {
+        "domains": ["kiro.dev", "api.kiro.dev"],
+        "bypass": True,
+        "priority": 5,
+    },
+    "hermes": {
+        "domains": ["hermes-ai.dev", "hermes.ai", "api.hermes-ai.dev", "api.hermes.ai"],
+        "bypass": True,
+        "priority": 6,
+    },
+}
+
+# Domains that bypass the upstream proxy and connect directly.
+BYPASS_DOMAINS: List[str] = [
+    "nvidia.com",
+    "anthropic.com",
+    "copilot.ai",
+    "githubcopilot.com",
+    "kiro.dev",
+    "opencode.dev",
+    "opencode.ai",
+    "antigravity.dev",
+    "hermes-ai.dev",
+    "hermes.ai",
+    "localhost",
+]
+
+# ---------------------------------------------------------------------------
+# Tunable limits (modified by AutoTuner at runtime)
+# ---------------------------------------------------------------------------
+MAX_CONNECTIONS: int = OWL_MAX_CONNECTIONS
+CACHE_MAX_ENTRIES: int = OWL_CACHE_MAX_ENTRIES
+
+# Buffer size per connection — memory-optimised for 32 KB.
+BUFFER_SIZE: int = 32 * 1024  # 32 KB
+
+
+# =====================================================================
+# AutoTuner — adjusts proxy parameters based on system RAM pressure
+# =====================================================================
+class AutoTuner:
+    """Reads /proc/meminfo every 30 s and dynamically adjusts
+    MAX_CONNECTIONS (2-10) and CACHE_MAX_ENTRIES (50-500) based on
+    RAM pressure.
+
+    Pressure thresholds:
+        > 85 % : shrink  (max_conn -1, cache -25)
+        < 70 % : grow    (max_conn +1, cache +25)
+        70-85% : hold
+    """
+
+    CHECK_INTERVAL: float = 30.0
+    PRESSURE_SHRINK: float = 85.0
+    PRESSURE_GROW: float = 70.0
+    CONN_MIN: int = 2
+    CONN_MAX: int = 10
+    CACHE_MIN: int = 50
+    CACHE_MAX: int = 500
+    CACHE_STEP: int = 25
+    CONN_STEP: int = 1
+
+    def __init__(self) -> None:
+        self._task: Optional[asyncio.Task[None]] = None
+        self.max_connections: int = OWL_MAX_CONNECTIONS
+        self.cache_max_entries: int = OWL_CACHE_MAX_ENTRIES
+
+    # ----- public API --------------------------------------------------
+
+    def start(self) -> None:
+        """Start the background auto-tune loop."""
+        self._task = asyncio.ensure_future(self.auto_tune_loop())
+        logger.info(
+            "AutoTuner started (interval=%.0fs, conn=%d, cache=%d)",
+            self.CHECK_INTERVAL,
+            self.max_connections,
+            self.cache_max_entries,
+        )
+
+    async def stop(self) -> None:
+        """Cancel the background loop."""
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        logger.info("AutoTuner stopped")
+
+    async def auto_tune_loop(self) -> None:
+        """Background loop: periodically read meminfo and adjust params."""
+        while True:
+            try:
+                pressure = self._read_ram_pressure()
+                if pressure is not None:
+                    self._apply(pressure)
+            except Exception as exc:
+                logger.warning("AutoTuner error: %s", exc)
+            await asyncio.sleep(self.CHECK_INTERVAL)
+
+    # ----- internals ---------------------------------------------------
+
+    def _read_ram_pressure(self) -> Optional[float]:
+        """Parse /proc/meminfo and return memory pressure as a percentage."""
+        try:
+            with open("/proc/meminfo", "r") as fh:
+                info: Dict[str, int] = {}
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        key = parts[0].rstrip(":")
+                        info[key] = int(parts[1])
+            total = info.get("MemTotal", 0)
+            available = info.get("MemAvailable", 0)
+            if total <= 0:
+                return None
+            used = total - available
+            return (used / total) * 100.0
+        except FileNotFoundError:
+            logger.debug("/proc/meminfo not found — skipping RAM check")
+            return None
+        except Exception as exc:
+            logger.warning("Failed to read /proc/meminfo: %s", exc)
+            return None
+
+    def _apply(self, pressure: float) -> None:
+        """Adjust limits based on *pressure* percentage."""
+        global MAX_CONNECTIONS, CACHE_MAX_ENTRIES
+
+        if pressure > self.PRESSURE_SHRINK:
+            self.max_connections = max(
+                self.CONN_MIN, self.max_connections - self.CONN_STEP
+            )
+            self.cache_max_entries = max(
+                self.CACHE_MIN, self.cache_max_entries - self.CACHE_STEP
+            )
+            logger.info(
+                "AutoTuner SHRINK: pressure=%.1f%% → conn=%d, cache=%d",
+                pressure,
+                self.max_connections,
+                self.cache_max_entries,
+            )
+        elif pressure < self.PRESSURE_GROW:
+            self.max_connections = min(
+                self.CONN_MAX, self.max_connections + self.CONN_STEP
+            )
+            self.cache_max_entries = min(
+                self.CACHE_MAX, self.cache_max_entries + self.CACHE_STEP
+            )
+            logger.info(
+                "AutoTuner GROW: pressure=%.1f%% → conn=%d, cache=%d",
+                pressure,
+                self.max_connections,
+                self.cache_max_entries,
+            )
+        else:
+            logger.debug(
+                "AutoTuner HOLD: pressure=%.1f%% (conn=%d, cache=%d)",
+                pressure,
+                self.max_connections,
+                self.cache_max_entries,
+            )
+
+        MAX_CONNECTIONS = self.max_connections
+        CACHE_MAX_ENTRIES = self.cache_max_entries
+
+
+# =====================================================================
+# MeshSync — UDP multicast for sharing proxy health across LAN
+# =====================================================================
+class MeshSync:
+    """Broadcasts and receives proxy health data over UDP multicast
+    (239.255.255.250:42100) so that multiple OWL proxy instances on
+    the same LAN can share load and awareness.
+
+    Methods:
+        broadcast_loop()   — sends proxy health every 30 s
+        listen_loop()      — receives peer proxy data
+        get_peer_proxies() — returns merged proxy list
+    """
+
+    MULTICAST_GROUP: str = "239.255.255.250"
+    BROADCAST_INTERVAL: float = 30.0
+    PEER_TTL: float = 90.0  # forget peers after 90 s of silence
+
+    def __init__(self, port: int = OWL_MESH_PORT) -> None:
+        self.port = port
+        self._peers: Dict[str, Dict[str, Any]] = {}
+        self._send_sock: Optional[socket.socket] = None
+        self._recv_sock: Optional[socket.socket] = None
+        self._broadcast_task: Optional[asyncio.Task[None]] = None
+        self._listen_task: Optional[asyncio.Task[None]] = None
+
+    # ----- public API --------------------------------------------------
+
+    def start(self) -> None:
+        """Create sockets and start broadcast/listen loops."""
+        self._setup_sockets()
+        self._broadcast_task = asyncio.ensure_future(self.broadcast_loop())
+        self._listen_task = asyncio.ensure_future(self.listen_loop())
+        logger.info(
+            "MeshSync started on %s:%d", self.MULTICAST_GROUP, self.port
+        )
+
+    async def stop(self) -> None:
+        """Cancel loops and close sockets."""
+        for task in (self._broadcast_task, self._listen_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        for sock in (self._send_sock, self._recv_sock):
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        logger.info("MeshSync stopped")
+
+    def get_peer_proxies(self) -> List[Dict[str, Any]]:
+        """Return a list of known peer proxies, expiring stale entries."""
+        now = time.monotonic()
+        stale = [
+            addr
+            for addr, data in self._peers.items()
+            if now - data.get("last_seen", 0) > self.PEER_TTL
+        ]
+        for addr in stale:
+            del self._peers[addr]
+        return list(self._peers.values())
+
+    async def broadcast_loop(self) -> None:
+        """Periodically broadcast local proxy health over multicast."""
+        while True:
+            try:
+                payload = json.dumps(
+                    {
+                        "type": "owl-mesh",
+                        "host": OWL_PROXY_HOST,
+                        "port": OWL_PROXY_PORT,
+                        "max_connections": MAX_CONNECTIONS,
+                        "cache_entries": CACHE_MAX_ENTRIES,
+                        "timestamp": time.time(),
+                        "last_seen": time.monotonic(),
+                    }
+                ).encode("utf-8")
+                if self._send_sock:
+                    self._send_sock.sendto(
+                        payload,
+                        (self.MULTICAST_GROUP, self.port),
+                    )
+                    logger.debug("MeshSync broadcast sent")
+            except Exception as exc:
+                logger.warning("MeshSync broadcast error: %s", exc)
+            await asyncio.sleep(self.BROADCAST_INTERVAL)
+
+    async def listen_loop(self) -> None:
+        """Receive peer proxy announcements from the multicast group."""
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                if not self._recv_sock:
+                    await asyncio.sleep(1)
+                    continue
+                data, addr = await loop.run_in_executor(
+                    None, self._recv_sock.recvfrom, 4096
+                )
+                msg = json.loads(data.decode("utf-8"))
+                if msg.get("type") == "owl-mesh":
+                    peer_addr = f"{msg['host']}:{msg['port']}"
+                    msg["last_seen"] = time.monotonic()
+                    msg["source_addr"] = addr[0]
+                    self._peers[peer_addr] = msg
+                    logger.debug(
+                        "MeshSync peer %s updated (conn=%d)",
+                        peer_addr,
+                        msg.get("max_connections", 0),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except json.JSONDecodeError:
+                logger.debug("MeshSync: invalid JSON from peer")
+            except Exception as exc:
+                logger.warning("MeshSync listen error: %s", exc)
+                await asyncio.sleep(1)
+
+    # ----- internals ---------------------------------------------------
+
+    def _setup_sockets(self) -> None:
+        """Create and configure UDP multicast send/receive sockets."""
+        # Send socket
+        self._send_sock = socket.socket(
+            socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP
+        )
+        self._send_sock.settimeout(2)
+
+        # Receive socket
+        self._recv_sock = socket.socket(
+            socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP
+        )
+        self._recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._recv_sock.bind(("", self.port))
+
+        # Join multicast group
+        mreq = struct.pack(
+            "4sl",
+            socket.inet_aton(self.MULTICAST_GROUP),
+            socket.INADDR_ANY,
+        )
+        self._recv_sock.setsockopt(
+            socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq
+        )
+        self._recv_sock.settimeout(2)
+
+
+# =====================================================================
+# PredictiveCircuitBreaker — per-domain circuit breaking
+# =====================================================================
+class CircuitState(enum.Enum):
+    """Circuit breaker states."""
+
+    CLOSED = "CLOSED"
+    OPEN = "OPEN"
+    HALF_OPEN = "HALF_OPEN"
+    PREDICTIVE_OPEN = "PREDICTIVE_OPEN"
+
+
+@dataclass
+class DomainCircuit:
+    """Per-domain circuit breaker state."""
+
+    state: CircuitState = CircuitState.CLOSED
+    latencies: deque[float] = field(default_factory=lambda: deque(maxlen=20))
+    failure_count: int = 0
+    last_failure_time: float = 0.0
+    opened_at: float = 0.0
+
+    @property
+    def p50(self) -> float:
+        """Median latency from recorded samples."""
+        if not self.latencies:
+            return 0.0
+        sorted_lat = sorted(self.latencies)
+        mid = len(sorted_lat) // 2
+        return sorted_lat[mid]
+
+    @property
+    def has_baseline(self) -> bool:
+        """True when we have enough samples for a reliable baseline."""
+        return len(self.latencies) >= 5
+
+
+class PredictiveCircuitBreaker:
+    """Tracks the last 20 request latencies per domain and opens the
+    circuit predictively when recent requests significantly exceed the
+    p50 baseline.
+
+    Predictive trigger:
+        After 5 samples establish a p50 baseline, if the last 3 requests
+        all exceed 2x the baseline the circuit transitions to
+        PREDICTIVE_OPEN.
+
+    Standard trigger (fallback):
+        5 consecutive failures transition to OPEN.
+
+    Recovery:
+        After 60 seconds in OPEN or PREDICTIVE_OPEN the circuit moves to
+        HALF_OPEN.  A successful request closes it again; a failure
+        re-opens it.
+    """
+
+    FAILURE_THRESHOLD: int = 5
+    PREDICTIVE_WINDOW: int = 3  # last N requests to check
+    PREDICTIVE_MULTIPLIER: float = 2.0
+    BASELINE_MIN_SAMPLES: int = 5
+    RECOVERY_TIMEOUT: float = 60.0  # seconds
+
+    def __init__(self) -> None:
+        self._circuits: Dict[str, DomainCircuit] = {}
+
+    def _get_circuit(self, domain: str) -> DomainCircuit:
+        if domain not in self._circuits:
+            self._circuits[domain] = DomainCircuit()
+        return self._circuits[domain]
+
+    def record_success(self, domain: str, latency: float) -> None:
+        """Record a successful request and potentially close the circuit."""
+        circuit = self._get_circuit(domain)
+        circuit.latencies.append(latency)
+        circuit.failure_count = 0
+
+        if circuit.state == CircuitState.HALF_OPEN:
+            circuit.state = CircuitState.CLOSED
+            logger.info("Circuit CLOSED for %s (recovered)", domain)
+        elif circuit.state == CircuitState.PREDICTIVE_OPEN:
+            circuit.state = CircuitState.CLOSED
+            logger.info("Circuit CLOSED for %s (predictive recovered)", domain)
+
+        # Check predictive trigger even on success (high latency)
+        self._check_predictive(domain, circuit)
+
+    def record_failure(self, domain: str) -> None:
+        """Record a failed request and potentially open the circuit."""
+        circuit = self._get_circuit(domain)
+        circuit.failure_count += 1
+        circuit.last_failure_time = time.monotonic()
+
+        if circuit.state == CircuitState.HALF_OPEN:
+            circuit.state = CircuitState.OPEN
+            circuit.opened_at = time.monotonic()
+            logger.warning(
+                "Circuit OPEN for %s (half-open probe failed)", domain
+            )
+            return
+
+        if circuit.failure_count >= self.FAILURE_THRESHOLD:
+            circuit.state = CircuitState.OPEN
+            circuit.opened_at = time.monotonic()
+            logger.warning(
+                "Circuit OPEN for %s (%d consecutive failures)",
+                domain,
+                circuit.failure_count,
+            )
+
+    def is_open(self, domain: str) -> bool:
+        """Return True if the circuit is currently open (blocking).
+
+        Also handles timeout-based recovery transitions.
+        """
+        circuit = self._get_circuit(domain)
+
+        if circuit.state == CircuitState.CLOSED:
+            return False
+
+        if circuit.state in (CircuitState.OPEN, CircuitState.PREDICTIVE_OPEN):
+            elapsed = time.monotonic() - circuit.opened_at
+            if elapsed >= self.RECOVERY_TIMEOUT:
+                circuit.state = CircuitState.HALF_OPEN
+                logger.info(
+                    "Circuit HALF_OPEN for %s (recovery timeout)", domain
+                )
+                return False  # allow one probe request
+            return True
+
+        if circuit.state == CircuitState.HALF_OPEN:
+            return False  # allow probe
+
+        return False
+
+    def get_state(self, domain: str) -> CircuitState:
+        """Return the current circuit state for a domain."""
+        return self._get_circuit(domain).state
+
+    # ----- internals ---------------------------------------------------
+
+    def _check_predictive(
+        self, domain: str, circuit: DomainCircuit
+    ) -> None:
+        """Check whether the last few requests predictively indicate
+        an overloaded or degraded upstream.
+
+        If the last PREDICTIVE_WINDOW requests all exceed
+        PREDICTIVE_MULTIPLIER * p50, transition to PREDICTIVE_OPEN.
+        """
+        if not circuit.has_baseline:
+            return
+        if circuit.state in (CircuitState.OPEN, CircuitState.PREDICTIVE_OPEN):
+            return
+
+        baseline = circuit.p50
+        if baseline <= 0:
+            return
+
+        recent = list(circuit.latencies)[-self.PREDICTIVE_WINDOW :]
+        if len(recent) < self.PREDICTIVE_WINDOW:
+            return
+
+        threshold = baseline * self.PREDICTIVE_MULTIPLIER
+        if all(lat > threshold for lat in recent):
+            circuit.state = CircuitState.PREDICTIVE_OPEN
+            circuit.opened_at = time.monotonic()
+            logger.warning(
+                "Circuit PREDICTIVE_OPEN for %s "
+                "(last %d requests > %.1fx baseline %.0fms)",
+                domain,
+                self.PREDICTIVE_WINDOW,
+                self.PREDICTIVE_MULTIPLIER,
+                baseline,
+            )
+
+
+# =====================================================================
+# Simple LRU DNS / response cache
+# =====================================================================
+class ProxyCache:
+    """Thread-safe (asyncio-safe) LRU cache with a maximum number of
+    entries. Used for DNS resolutions and small HTTP responses.
+    """
+
+    def __init__(self, max_entries: int = OWL_CACHE_MAX_ENTRIES) -> None:
+        from collections import OrderedDict
+        self._store: OrderedDict[str, Tuple[float, Any]] = OrderedDict()
+        self._max = max_entries
+        self._hits = 0
+        self._misses = 0
+
+    def get(self, key: str) -> Optional[Any]:
+        entry = self._store.get(key)
+        if entry is None:
+            self._misses += 1
+            return None
+        expires_at, value = entry
+        # Check TTL before returning
+        if time.monotonic() > expires_at:
+            del self._store[key]
+            self._misses += 1
+            return None
+        # Move to end (most recently used)
+        self._store.move_to_end(key)
+        self._hits += 1
+        return value
+
+    def put(self, key: str, value: Any, ttl: float = 300.0) -> None:
+        max_entries = CACHE_MAX_ENTRIES  # read the global (AutoTuner may change it)
+        # Evict oldest entries while over capacity (O(1) with OrderedDict)
+        while len(self._store) >= max_entries:
+            self._store.popitem(last=False)
+        self._store[key] = (time.monotonic() + ttl, value)
+        self._store.move_to_end(key)
+
+    def cleanup(self) -> None:
+        """Remove expired entries."""
+        now = time.monotonic()
+        expired = [k for k, (exp, _) in self._store.items() if exp <= now]
+        for k in expired:
+            del self._store[k]
+
+    @property
+    def stats(self) -> Dict[str, int]:
+        return {
+            "entries": len(self._store),
+            "max": CACHE_MAX_ENTRIES,
+            "hits": self._hits,
+            "misses": self._misses,
+        }
+
+
+# =====================================================================
+# Utility helpers
+# =====================================================================
+def domain_matches_bypass(hostname: str) -> bool:
+    """Check whether *hostname* matches any bypass domain pattern.
+
+    Bypass domains (direct connection, skip upstream proxy):
+        *.nvidia.com, *.copilot.ai, *.kiro.dev, *.opencode.ai,
+        *.antigravity.dev, *.hermes.ai, localhost
+    """
+    if hostname == "localhost" or hostname.startswith("localhost:"):
+        return True
+    for suffix in BYPASS_DOMAINS:
+        if hostname == suffix or hostname.endswith("." + suffix):
+            return True
+    return False
+
+
+def resolve_upstream_proxy() -> Optional[Tuple[str, int]]:
+    """Parse UPSTREAM_PROXY env var into (host, port) or None."""
+    if not UPSTREAM_PROXY:
+        return None
+    try:
+        parsed = urlparse(UPSTREAM_PROXY)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 7890
+        return (host, port)
+    except Exception as exc:
+        logger.warning("Invalid UPSTREAM_PROXY '%s': %s", UPSTREAM_PROXY, exc)
+        return None
+
+
+async def _relay(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    name: str,
+) -> None:
+    """Relay data between two streams until EOF or error."""
+    try:
+        while True:
+            data = await reader.read(BUFFER_SIZE)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
+        pass
+    except Exception as exc:
+        logger.debug("%s relay error: %s", name, exc)
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+# =====================================================================
+# Main proxy handler
+# =====================================================================
+class OwlForwardProxy:
+    """Asyncio-based HTTP/HTTPS forward proxy with circuit breaking,
+    upstream proxy support, and provider-aware routing.
+
+    Port: 60000 (default)
+    """
+
+    def __init__(self) -> None:
+        self.auto_tuner = AutoTuner()
+        self.mesh_sync = MeshSync() if OWL_ENABLE_MESH else None
+        self.circuit_breaker = PredictiveCircuitBreaker()
+        self.cache = ProxyCache()
+        self._semaphore = asyncio.Semaphore(MAX_CONNECTIONS)
+        self._server: Optional[asyncio.AbstractServer] = None
+
+    # ----- lifecycle ---------------------------------------------------
+
+    async def start(self) -> None:
+        """Start the proxy server and all background services."""
+        self.auto_tuner.start()
+        if self.mesh_sync:
+            self.mesh_sync.start()
+
+        # Periodic cache cleanup
+        asyncio.ensure_future(self._cache_cleanup_loop())
+
+        self._server = await asyncio.start_server(
+            self._accept,
+            OWL_PROXY_HOST,
+            OWL_PROXY_PORT,
+        )
+        logger.info(
+            "OWL Forward Proxy v3.0 listening on %s:%d",
+            OWL_PROXY_HOST,
+            OWL_PROXY_PORT,
+        )
+        if UPSTREAM_PROXY:
+            logger.info("Upstream proxy: %s", UPSTREAM_PROXY)
+        logger.info(
+            "Bypass domains: %s", ", ".join(BYPASS_DOMAINS)
+        )
+
+    async def run_forever(self) -> None:
+        """Block until the server is stopped."""
+        if self._server:
+            async with self._server:
+                await self._server.serve_forever()
+
+    async def stop(self) -> None:
+        """Gracefully shut down all components."""
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+        await self.auto_tuner.stop()
+        if self.mesh_sync:
+            await self.mesh_sync.stop()
+        logger.info("OWL Forward Proxy stopped")
+
+    # ----- connection acceptance ---------------------------------------
+
+    async def _accept(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        """Accept a new client connection, enforcing the concurrency limit."""
+        # Dynamically adjust semaphore if AutoTuner changed MAX_CONNECTIONS
+        current_max = self._semaphore._value + (MAX_CONNECTIONS - self.auto_tuner.max_connections)
+        if self._semaphore._value != MAX_CONNECTIONS and self._semaphore._value == 0:
+            # Only recreate if no one is holding the semaphore
+            self._semaphore = asyncio.Semaphore(MAX_CONNECTIONS)
+        async with self._semaphore:
+            try:
+                await self.handle_client(reader, writer)
+            except Exception as exc:
+                logger.error("Unhandled client error: %s", exc)
+            finally:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+    # ----- main request handler ----------------------------------------
+
+    async def handle_client(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """Handle a single client connection (HTTP or CONNECT).
+
+        - CONNECT method: HTTPS tunnelling with optional upstream proxy
+        - HTTP method: standard forward-proxy with domain bypass logic
+        - All requests go through the PredictiveCircuitBreaker
+        """
+        peer = writer.get_extra_info("peername")
+        try:
+            header_line = await asyncio.wait_for(
+                reader.readline(), timeout=OWL_PROXY_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.debug("Timeout reading from %s", peer)
+            return
+
+        if not header_line:
+            return
+
+        try:
+            request_line = header_line.decode("utf-8", errors="replace").strip()
+            parts = request_line.split()
+            if len(parts) < 2:
+                return
+            method, target = parts[0], parts[1]
+        except Exception:
+            return
+
+        logger.debug("%s %s from %s", method, target, peer)
+
+        if method == "CONNECT":
+            await self._handle_connect(reader, writer, target)
+        else:
+            await self._handle_http(reader, writer, method, target, request_line)
+
+    # ----- CONNECT (HTTPS tunnel) --------------------------------------
+
+    async def _handle_connect(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        target: str,
+    ) -> None:
+        """Handle HTTPS CONNECT tunnelling.
+
+        If an upstream proxy is configured and the domain does not
+        match a bypass pattern, the connection is routed through the
+        upstream proxy.  Otherwise, a direct connection is made.
+        """
+        # Parse host:port
+        if ":" in target:
+            host, port_str = target.rsplit(":", 1)
+            try:
+                port = int(port_str)
+            except ValueError:
+                writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                return
+        else:
+            host, port = target, 443
+
+        # Circuit breaker check
+        if self.circuit_breaker.is_open(host):
+            logger.warning("Circuit open for %s — rejecting CONNECT", host)
+            writer.write(b"HTTP/1.1 503 Service Unavailable\r\n\r\n")
+            return
+
+        # Drain remaining headers
+        try:
+            while True:
+                line = await asyncio.wait_for(
+                    reader.readline(), timeout=OWL_CONNECT_TIMEOUT
+                )
+                if line in (b"\r\n", b"\n", b""):
+                    break
+        except asyncio.TimeoutError:
+            return
+
+        bypass = domain_matches_bypass(host)
+        upstream = resolve_upstream_proxy()
+
+        start = time.monotonic()
+        remote_writer: Optional[asyncio.StreamWriter] = None
+
+        try:
+            if not bypass and upstream:
+                # Connect via upstream proxy (Mihomo/Clash)
+                remote_reader, remote_writer = await asyncio.wait_for(
+                    asyncio.open_connection(upstream[0], upstream[1]),
+                    timeout=OWL_CONNECT_TIMEOUT,
+                )
+                # Send CONNECT to upstream
+                connect_req = (
+                    f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n"
+                ).encode("utf-8")
+                remote_writer.write(connect_req)
+                await remote_writer.drain()
+
+                # Read upstream response
+                resp = await asyncio.wait_for(
+                    remote_reader.readline(), timeout=OWL_CONNECT_TIMEOUT
+                )
+                if not resp or b"200" not in resp:
+                    logger.warning(
+                        "Upstream proxy rejected CONNECT %s: %s",
+                        target,
+                        resp.decode("utf-8", errors="replace").strip(),
+                    )
+                    writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    return
+
+                # Drain upstream headers
+                while True:
+                    line = await asyncio.wait_for(
+                        remote_reader.readline(),
+                        timeout=OWL_CONNECT_TIMEOUT,
+                    )
+                    if line in (b"\r\n", b"\n", b""):
+                        break
+            else:
+                # Direct connection
+                remote_reader, remote_writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port),
+                    timeout=OWL_CONNECT_TIMEOUT,
+                )
+
+            # Tell client the tunnel is ready
+            writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await writer.drain()
+
+            # Bidirectional relay
+            await asyncio.gather(
+                _relay(reader, remote_writer, f"client→{host}"),
+                _relay(remote_reader, writer, f"{host}→client"),
+            )
+
+            latency = time.monotonic() - start
+            self.circuit_breaker.record_success(host, latency)
+
+        except asyncio.TimeoutError:
+            self.circuit_breaker.record_failure(host)
+            logger.warning("CONNECT timeout to %s", target)
+            try:
+                writer.write(b"HTTP/1.1 504 Gateway Timeout\r\n\r\n")
+            except Exception:
+                pass
+        except ConnectionRefusedError:
+            self.circuit_breaker.record_failure(host)
+            logger.warning("CONNECT refused for %s", target)
+            try:
+                writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            except Exception:
+                pass
+        except Exception as exc:
+            self.circuit_breaker.record_failure(host)
+            logger.warning("CONNECT error for %s: %s", target, exc)
+            try:
+                writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            except Exception:
+                pass
+        finally:
+            if remote_writer:
+                try:
+                    remote_writer.close()
+                    await remote_writer.wait_closed()
+                except Exception:
+                    pass
+
+    # ----- HTTP (forward) ----------------------------------------------
+
+    async def _handle_http(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        method: str,
+        target: str,
+        request_line: str,
+    ) -> None:
+        """Handle plain HTTP requests.
+
+        Bypass domains connect directly; all others route through the
+        upstream proxy if configured.
+        """
+        parsed = urlparse(target)
+        host = parsed.hostname or ""
+        port = parsed.port or 80
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+
+        # Circuit breaker check
+        if self.circuit_breaker.is_open(host):
+            logger.warning("Circuit open for %s — rejecting request", host)
+            writer.write(b"HTTP/1.1 503 Service Unavailable\r\n\r\n")
+            return
+
+        # Read remaining request headers
+        headers: List[str] = []
+        content_length = 0
+        try:
+            while True:
+                line = await asyncio.wait_for(
+                    reader.readline(), timeout=OWL_PROXY_TIMEOUT
+                )
+                decoded = line.decode("utf-8", errors="replace").strip()
+                if not decoded:
+                    break
+                headers.append(decoded)
+                lower = decoded.lower()
+                if lower.startswith("content-length:"):
+                    try:
+                        content_length = int(lower.split(":", 1)[1].strip())
+                    except ValueError:
+                        pass
+        except asyncio.TimeoutError:
+            return
+
+        # Read body if present (with size limit to prevent memory exhaustion)
+        body = b""
+        if content_length > 0:
+            if content_length > 10 * 1024 * 1024:  # 10 MiB limit
+                logger.warning("Request body too large: %d bytes for %s", content_length, target)
+                writer.write(b"HTTP/1.1 413 Payload Too Large\r\n\r\n")
+                return
+            try:
+                body = await asyncio.wait_for(
+                    reader.readexactly(content_length),
+                    timeout=OWL_PROXY_TIMEOUT,
+                )
+            except (asyncio.TimeoutError, asyncio.IncompleteReadError):
+                return
+
+        # Build outgoing request
+        outgoing_headers = f"{method} {path} HTTP/1.1\r\n"
+        outgoing_headers += f"Host: {host}\r\n"
+        for hdr in headers:
+            # Skip hop-by-hop headers
+            lower = hdr.lower()
+            if lower.startswith("proxy-") or lower.startswith("connection:"):
+                continue
+            outgoing_headers += f"{hdr}\r\n"
+        if "Connection" not in outgoing_headers:
+            outgoing_headers += "Connection: close\r\n"
+        outgoing_headers += "\r\n"
+
+        bypass = domain_matches_bypass(host)
+        upstream = resolve_upstream_proxy()
+
+        start = time.monotonic()
+        remote_writer: Optional[asyncio.StreamWriter] = None
+
+        try:
+            if not bypass and upstream:
+                remote_reader, remote_writer = await asyncio.wait_for(
+                    asyncio.open_connection(upstream[0], upstream[1]),
+                    timeout=OWL_CONNECT_TIMEOUT,
+                )
+                # Send full URL to upstream proxy
+                proxy_req = f"{method} {target} HTTP/1.1\r\n"
+                for hdr in headers:
+                    lower = hdr.lower()
+                    if lower.startswith("proxy-"):
+                        continue
+                    proxy_req += f"{hdr}\r\n"
+                proxy_req += "Connection: close\r\n\r\n"
+                remote_writer.write(proxy_req.encode("utf-8"))
+            else:
+                remote_reader, remote_writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port),
+                    timeout=OWL_CONNECT_TIMEOUT,
+                )
+                remote_writer.write(outgoing_headers.encode("utf-8"))
+
+            if body:
+                remote_writer.write(body)
+            await remote_writer.drain()
+
+            # Relay response back to client
+            await _relay(remote_reader, writer, f"http:{host}")
+
+            latency = time.monotonic() - start
+            self.circuit_breaker.record_success(host, latency)
+
+        except asyncio.TimeoutError:
+            self.circuit_breaker.record_failure(host)
+            logger.warning("HTTP timeout for %s %s", method, target)
+        except Exception as exc:
+            self.circuit_breaker.record_failure(host)
+            logger.warning("HTTP error for %s %s: %s", method, target, exc)
+        finally:
+            if remote_writer:
+                try:
+                    remote_writer.close()
+                    await remote_writer.wait_closed()
+                except Exception:
+                    pass
+
+    # ----- background tasks --------------------------------------------
+
+    async def _cache_cleanup_loop(self) -> None:
+        """Periodically purge expired cache entries."""
+        while True:
+            await asyncio.sleep(60)
+            self.cache.cleanup()
+
+
+# =====================================================================
+# Entry point
+# =====================================================================
+async def main() -> None:
+    """Start the OWL Forward Proxy and run until interrupted."""
+    proxy = OwlForwardProxy()
+
+    loop = asyncio.get_running_loop()
+
+    def _shutdown() -> None:
+        asyncio.ensure_future(proxy.stop())
+
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, _shutdown)
+    except (AttributeError, NotImplementedError):
+        # Windows / platforms without signal handlers
+        pass
+
+    await proxy.start()
+
+    logger.info(
+        "Providers configured: %s",
+        ", ".join(
+            f"{name}(p{cfg['priority']})"
+            for name, cfg in sorted(
+                PROVIDERS.items(), key=lambda x: x[1]["priority"]
+            )
+        ),
+    )
+    logger.info(
+        "Config: host=%s port=%d max_conn=%d cache=%d "
+        "connect_timeout=%d proxy_timeout=%d mesh=%s enrich=%s",
+        OWL_PROXY_HOST,
+        OWL_PROXY_PORT,
+        MAX_CONNECTIONS,
+        CACHE_MAX_ENTRIES,
+        OWL_CONNECT_TIMEOUT,
+        OWL_PROXY_TIMEOUT,
+        OWL_ENABLE_MESH,
+        OWL_ENRICH_ENABLED,
+    )
+
+    try:
+        await proxy.run_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        await proxy.stop()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -1,0 +1,103 @@
+# =============================================================================
+# OWL-AGENT Unified Synergy — Podman Containerfile v7.0
+#
+# Build:
+#   podman build -t owl-agent:7.0 -t owl-agent:latest .
+#
+# Run (standalone):
+#   podman run -d --name owl-proxy \
+#     -p 60000:60000 \
+#     -e UPSTREAM_PROXY=http://host.containers.internal:7890 \
+#     owl-agent:7.0
+#
+# Run (with mesh + gateway):
+#   podman run -d --name owl-full \
+#     -p 60000:60000 -p 8333:8333 -p 42100:42100/udp \
+#     -e OWL_ENABLE_MESH=true \
+#     -e OWL_ENRICH_ENABLED=true \
+#     -e UPSTREAM_PROXY=http://host.containers.internal:7890 \
+#     owl-agent:7.0
+#
+# Compose:
+#   podman-compose up -d
+#
+# Why Podman over Docker?
+#   - Rootless by default (no daemon, no socket exposure)
+#   - Podman pods share network namespace (like k8s)
+#   - systemd integration via quadlet (.container files)
+#   - Compatible with Docker CLI (alias docker=podman)
+#   - SELinux/AppArmor friendly on Ubuntu
+# =============================================================================
+
+FROM ubuntu:22.04 AS base
+
+LABEL maintainer="OWL-AGENT"
+LABEL version="7.0"
+LABEL description="OWL-AGENT Unified Synergy - 6-provider AI proxy (Antigravity, Claude, OpenCode, Copilot, Kiro, Hermes) with Auto-Tuner, Mesh Sync, Predictive Breaker"
+
+# ── System deps ──────────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv python3-dev \
+    libffi-dev libssl-dev build-essential \
+    curl wget unzip git jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Create non-root user (Podman best practice) ─────────────────────────────
+RUN useradd -m -s /bin/bash owl
+USER owl
+WORKDIR /home/owl
+
+# ── Python venv ──────────────────────────────────────────────────────────────
+RUN python3 -m venv /home/owl/venv
+ENV PATH="/home/owl/venv/bin:$PATH"
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir 'httpx[http2]' aiohttp aiofiles
+
+# ── App structure ────────────────────────────────────────────────────────────
+RUN mkdir -p /home/owl/.owl-agent/{config,logs,cache/http}
+
+# ── Copy application files ──────────────────────────────────────────────────
+COPY --chown=owl:owl forward_proxy.py           /home/owl/.owl-agent/
+COPY --chown=owl:owl proxy_defense_fixed_v3.py   /home/owl/.owl-agent/
+COPY --chown=owl:owl owl_resilient_mcp.py        /home/owl/.owl-agent/
+COPY --chown=owl:owl diagnose.sh                 /home/owl/.owl-agent/
+# proxy_pool.json is optional — only needed when using a static proxy pool
+COPY --chown=owl:owl proxy_pool.json             /home/owl/.owl-agent/config/
+COPY --chown=owl:owl mesh_alternatives.py         /home/owl/.owl-agent/
+COPY --chown=owl:owl entrypoint.sh               /home/owl/
+RUN chmod +x /home/owl/entrypoint.sh /home/owl/.owl-agent/diagnose.sh
+
+# ── Default config ──────────────────────────────────────────────────────────
+# proxy_sources.json is optional — only needed when using proxy source lists
+COPY --chown=owl:owl proxy_sources.json          /home/owl/.owl-agent/config/
+
+# Ensure default config files exist (in case optional COPY was skipped)
+RUN touch /home/owl/.owl-agent/config/proxy_pool.json /home/owl/.owl-agent/config/proxy_sources.json 2>/dev/null || true
+
+# ── Ports ────────────────────────────────────────────────────────────────────
+# 60000 — Forward Proxy
+# 8333  — Kiro Gateway (optional, not included in this image by default)
+# 42100 — Mesh Sync UDP (optional)
+
+EXPOSE 60000/tcp 42100/udp
+
+# ── Environment defaults (8GB RAM optimized) ────────────────────────────────
+ENV OWL_PROXY_HOST=0.0.0.0
+ENV OWL_PROXY_PORT=60000
+ENV OWL_MAX_CONNECTIONS=5
+ENV OWL_CACHE_MAX_ENTRIES=200
+ENV OWL_HEALTH_CHECK_SAMPLE=10
+ENV OWL_PROXY_TIMEOUT=20
+ENV OWL_CONNECT_TIMEOUT=15
+ENV OWL_ENRICH_ENABLED=false
+ENV OWL_ENABLE_MESH=false
+ENV OWL_MESH_PORT=42100
+ENV UPSTREAM_PROXY=""
+
+# ── Health check ─────────────────────────────────────────────────────────────
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -sf --max-time 3 http://127.0.0.1:60000/health || exit 1
+
+# ── Entrypoint ──────────────────────────────────────────────────────────────
+ENTRYPOINT ["/home/owl/entrypoint.sh"]
+CMD ["proxy"]

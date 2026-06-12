@@ -1,0 +1,16 @@
+{
+  "tier_1_managed_free": {
+    "providers": [
+      {
+        "url": "http://127.0.0.1:60000",
+        "type": "http",
+        "protocol": "http",
+        "note": "Local OWL forward proxy"
+      }
+    ]
+  },
+  "tier_2_public": {
+    "providers": []
+  },
+  "comment": "Add your proxy providers here. See proxy_sources.json for auto-discovery."
+}

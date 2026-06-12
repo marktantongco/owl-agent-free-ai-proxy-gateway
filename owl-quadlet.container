@@ -1,0 +1,67 @@
+# =============================================================================
+# OWL-AGENT Quadlet (.container) for systemd integration
+#
+# Podman Quadlet converts .container files into systemd units automatically.
+# This is the recommended way to run Podman containers on Ubuntu with systemd.
+#
+# Install:
+#   mkdir -p ~/.config/containers/systemd
+#   cp owl-quadlet.container ~/.config/containers/systemd/
+#   systemctl --user daemon-reload
+#   systemctl --user start owl-proxy
+#
+# The container file is read by systemd-generator at daemon-reload time.
+# =============================================================================
+
+[Unit]
+Description=OWL-AGENT 6-Provider Proxy v7.0 (Antigravity, Claude, OpenCode, Copilot, Kiro, Hermes)
+After=network.target
+
+[Container]
+Image=owl-agent:7.0
+ContainerName=owl-proxy
+
+# Network
+PublishPort=60000:60000
+PublishPort=42100:42100/udp
+
+# Environment
+Environment=OWL_PROXY_HOST=0.0.0.0
+Environment=OWL_PROXY_PORT=60000
+Environment=OWL_MAX_CONNECTIONS=5
+Environment=OWL_CACHE_MAX_ENTRIES=200
+Environment=OWL_ENRICH_ENABLED=false
+Environment=OWL_ENABLE_MESH=false
+Environment=OWL_MESH_PORT=42100
+
+# Volumes
+Volume=owl-proxy-config:/home/owl/.owl-agent/config
+Volume=owl-proxy-logs:/home/owl/.owl-agent/logs
+Volume=owl-proxy-cache:/home/owl/.owl-agent/cache
+
+# Resource limits (8GB RAM system)
+MemoryMax=512m
+MemoryHigh=384m
+
+# Security
+SecurityOpt=no-new-privileges
+DropCapability=ALL
+
+# Logging
+LogDriver=journald
+
+# Auto-update
+AutoUpdate=registry
+
+# Health check
+HealthCheckCmd=curl -sf --max-time 3 http://127.0.0.1:60000/health || exit 1
+HealthCheckInterval=30s
+HealthCheckTimeout=5s
+HealthCheckRetries=3
+
+[Service]
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
