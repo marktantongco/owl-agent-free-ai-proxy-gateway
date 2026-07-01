@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════
-#  OWL-AGENT v7.0 — Diagnostics v2.0
+#  OWL-AGENT v7.1 — Diagnostics v3.0
 #  5-Section Health Check: Service · Connectivity · Environment · Resources · Auto-Tune
+#
+#  v7.1 changes:
+#   - DELETED --fix mode. Diagnostics report; humans fix.
+#     The v7.0 --fix mode ran commands as root with `2>/dev/null` swallowing
+#     all errors — false confidence, no debugging. v7.1 prints the exact
+#     command to run instead.
+#   - DELETED httpbin.org dependency. Connectivity check uses the proxy's
+#     own /health endpoint.
+#   - DELETED `rg` dependency. Falls back to `grep` when ripgrep isn't
+#     installed.
 # ═══════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
-readonly VERSION="2.0"
+readonly VERSION="3.0"
 readonly OWL_HOME="${OWL_HOME:-$HOME/.owl-agent}"
 readonly PROXY_PORT=60000
 readonly GATEWAY_PORT=8333
@@ -22,7 +32,6 @@ readonly NC='\033[0m'
 
 # ── Flags ──────────────────────────────────────────────────────────────────
 VERBOSE=false
-FIX=false
 FAILURES=0
 
 # ── Logging ────────────────────────────────────────────────────────────────
@@ -41,9 +50,12 @@ USAGE:
   $(basename "$0") [OPTIONS]
 
 OPTIONS:
-  --verbose    Show detailed output
-  --fix        Attempt automatic repair of detected issues
+  --verbose    Show detailed output (logs, full JSON responses)
   -h, --help   Show this help message
+
+NOTE:
+  v7.1 no longer has a --fix mode. When an issue is detected, the
+  suggested command is printed for you to run manually.
 EOF
   exit 0
 }
@@ -53,26 +65,39 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --verbose) VERBOSE=true; shift ;;
-      --fix)     FIX=true; shift ;;
       -h|--help) usage ;;
+      --fix)     echo "--fix mode has been removed in v7.1. Diagnostics report; humans fix." >&2; exit 2 ;;
       *) echo "Unknown option: $1"; usage ;;
     esac
   done
 }
 
-# ── Fix helper ─────────────────────────────────────────────────────────────
-try_fix() {
+# ── Suggest fix helper (replaces v7.0 try_fix) ────────────────────────────
+suggest_fix() {
   local desc="$1"
-  shift
-  if [[ "${FIX}" == true ]]; then
-    echo -e "  ${YELLOW}⟳${NC} Fixing: ${desc}"
-    if "$@" 2>/dev/null; then
-      echo -e "  ${GREEN}✓${NC} Fixed: ${desc}"
-    else
-      echo -e "  ${RED}✗${NC} Could not fix: ${desc}"
-    fi
+  local cmd="$2"
+  echo -e "  ${YELLOW}→ Suggested fix:${NC} ${desc}"
+  echo -e "    ${DIM}\$ ${cmd}${NC}"
+}
+
+# ── Search helper: use rg if available, otherwise grep ────────────────────
+search() {
+  local pattern="$1"
+  local file="$2"
+  if command -v rg &>/dev/null; then
+    rg -c "${pattern}" "${file}" 2>/dev/null || echo "0"
   else
-    warn "Issue detected. Run with --fix to attempt repair."
+    grep -cE "${pattern}" "${file}" 2>/dev/null || echo "0"
+  fi
+}
+
+search_lines() {
+  local pattern="$1"
+  local file="$2"
+  if command -v rg &>/dev/null; then
+    rg "${pattern}" "${file}" 2>/dev/null | tail -5
+  else
+    grep -E "${pattern}" "${file}" 2>/dev/null | tail -5
   fi
 }
 
@@ -82,30 +107,27 @@ try_fix() {
 section_service_status() {
   header "1. Service Status"
 
-  # ── owl-forward-proxy ────────────────────────────────────────────────
   if systemctl is-active --quiet owl-forward-proxy 2>/dev/null; then
     pass "owl-forward-proxy service: active"
   else
     fail "owl-forward-proxy service: NOT running"
-    try_fix "start owl-forward-proxy" sudo systemctl start owl-forward-proxy
+    suggest_fix "start the proxy service" "sudo systemctl start owl-forward-proxy"
   fi
 
   if systemctl is-enabled --quiet owl-forward-proxy 2>/dev/null; then
     pass "owl-forward-proxy: enabled on boot"
   else
     warn "owl-forward-proxy: not enabled on boot"
-    try_fix "enable owl-forward-proxy" sudo systemctl enable owl-forward-proxy
+    suggest_fix "enable on boot" "sudo systemctl enable owl-forward-proxy"
   fi
 
-  # ── kiro-gateway ─────────────────────────────────────────────────────
   if systemctl is-active --quiet kiro-gateway 2>/dev/null; then
     pass "kiro-gateway service: active"
   else
     warn "kiro-gateway service: NOT running (may be --skip-gateway)"
-    try_fix "start kiro-gateway" sudo systemctl start kiro-gateway
+    suggest_fix "start the gateway (if installed)" "sudo systemctl start kiro-gateway"
   fi
 
-  # ── Port checks ──────────────────────────────────────────────────────
   if ss -tlnp 2>/dev/null | grep -q ":${PROXY_PORT} "; then
     pass "Port ${PROXY_PORT} (proxy): listening"
   else
@@ -118,7 +140,6 @@ section_service_status() {
     warn "Port ${GATEWAY_PORT} (gateway): NOT listening"
   fi
 
-  # ── Process check ────────────────────────────────────────────────────
   if pgrep -f "forward_proxy.py" &>/dev/null; then
     pass "forward_proxy.py process: running (PID $(pgrep -f "forward_proxy.py" | head -1))"
   else
@@ -131,7 +152,6 @@ section_service_status() {
     warn "kiro-gateway process: NOT running"
   fi
 
-  # ── Verbose: journal tail ────────────────────────────────────────────
   if [[ "${VERBOSE}" == true ]]; then
     echo -e "\n  ${DIM}── Recent owl-forward-proxy logs ──${NC}"
     sudo journalctl -u owl-forward-proxy --no-pager -n 10 2>/dev/null || echo "  (no logs available)"
@@ -141,31 +161,35 @@ section_service_status() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SECTION 2: Connectivity
+#  SECTION 2: Connectivity (no external httpbin.org dependency)
 # ═══════════════════════════════════════════════════════════════════════════
 section_connectivity() {
   header "2. Connectivity"
 
-  # ── Proxy connectivity ───────────────────────────────────────────────
-  local proxy_url="http://127.0.0.1:${PROXY_PORT}"
-
-  if curl -x "${proxy_url}" -s -o /dev/null -w "%{http_code}" --connect-timeout 5 \
-       https://httpbin.org/ip 2>/dev/null | grep -qE "2[0-9]{2}"; then
-    pass "Proxy ${proxy_url}: forwarding works"
-  else
-    local proxy_code
-    proxy_code=$(curl -x "${proxy_url}" -s -o /dev/null -w "%{http_code}" --connect-timeout 5 \
-                  https://httpbin.org/ip 2>/dev/null || echo "000")
-    fail "Proxy ${proxy_url}: not forwarding (HTTP ${proxy_code})"
-  fi
-
-  # ── Proxy health endpoint ────────────────────────────────────────────
+  # ── Proxy health endpoint (local, no external dependency) ────────────
   local health_resp
   health_resp=$(curl -s --connect-timeout 3 "http://127.0.0.1:${PROXY_PORT}/health" 2>/dev/null || echo "")
-  if [[ "${health_resp}" == "ok" ]]; then
-    pass "Proxy health endpoint: OK"
+  if echo "${health_resp}" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['status']=='ok'" 2>/dev/null; then
+    pass "Proxy /health: OK"
+    if [[ "${VERBOSE}" == true ]]; then
+      echo -e "  ${DIM}$(echo "${health_resp}" | python3 -m json.tool 2>/dev/null)${NC}"
+    fi
   else
-    fail "Proxy health endpoint: not responding (got: '${health_resp}')"
+    fail "Proxy /health: not responding or malformed (got: '${health_resp:0:80}')"
+    suggest_fix "check proxy is running" "sudo systemctl status owl-forward-proxy"
+  fi
+
+  # ── Proxy forwarding test via allowed domain ─────────────────────────
+  # Use an allowlisted domain so the SSRF guard doesn't reject the probe.
+  local proxy_url="http://127.0.0.1:${PROXY_PORT}"
+  local probe_code
+  probe_code=$(curl -x "${proxy_url}" -s -o /dev/null -w "%{http_code}" \
+               --connect-timeout 5 -m 10 \
+               https://api.anthropic.com/ 2>/dev/null || echo "000")
+  if [[ "${probe_code}" =~ ^[2-4][0-9]{2}$ ]]; then
+    pass "Proxy forwarding: working (probe returned ${probe_code})"
+  else
+    fail "Proxy forwarding: not working (probe returned ${probe_code})"
   fi
 
   # ── Gateway /v1/models ───────────────────────────────────────────────
@@ -181,7 +205,7 @@ section_connectivity() {
   fi
 
   # ── Direct internet ──────────────────────────────────────────────────
-  if curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 https://www.google.com 2>/dev/null | grep -qE "2[0-9]{2}"; then
+  if curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 -m 8 https://www.google.com 2>/dev/null | grep -qE "2[0-9]{2}|3[0-9]{2}"; then
     pass "Direct internet: reachable"
   else
     warn "Direct internet: may be blocked (expected if proxy-required network)"
@@ -192,6 +216,7 @@ section_connectivity() {
     pass "DNS resolution: working (api.anthropic.com)"
   else
     fail "DNS resolution: FAILED for api.anthropic.com"
+    suggest_fix "check /etc/resolv.conf" "cat /etc/resolv.conf"
   fi
 }
 
@@ -201,7 +226,6 @@ section_connectivity() {
 section_environment() {
   header "3. Environment Variables"
 
-  # ── Proxy env vars ───────────────────────────────────────────────────
   local proxy_vars=(HTTP_PROXY HTTPS_PROXY UPSTREAM_PROXY NO_PROXY)
   for var in "${proxy_vars[@]}"; do
     local val="${!var:-<unset>}"
@@ -216,7 +240,6 @@ section_environment() {
     fi
   done
 
-  # ── API key env vars ─────────────────────────────────────────────────
   local api_vars=(ANTIGRAVITY_API_KEY ANTHROPIC_API_KEY OPENCODE_API_KEY GITHUB_COPILOT_TOKEN KIRO_API_KEY HERMES_API_KEY)
   echo -e "\n  ${DIM}── API Keys ──${NC}"
   for var in "${api_vars[@]}"; do
@@ -234,20 +257,21 @@ section_environment() {
     fi
   done
 
-  # ── OWL-specific env vars ────────────────────────────────────────────
-  local owl_vars=(OWL_HOME OWL_PROXY_HOST OWL_PROXY_PORT OWL_RATE_LIMIT_RPM OWL_MCP_PORT)
+  local owl_vars=(OWL_HOME OWL_PROXY_HOST OWL_PROXY_PORT OWL_PROXY_TOKEN OWL_MAX_CONNECTIONS OWL_ENABLE_MESH OWL_MESH_PORT OWL_ALLOW_EXTRA)
   echo -e "\n  ${DIM}── OWL Configuration ──${NC}"
   for var in "${owl_vars[@]}"; do
     local val="${!var:-<default>}"
+    if [[ "${var}" == "OWL_PROXY_TOKEN" && -n "${!var:-}" ]]; then
+      val="<set, length=${#val}>"
+    fi
     info "${var}=${val}"
   done
 
-  # ── PATH check ───────────────────────────────────────────────────────
   if [[ ":${PATH}:" == *":${HOME}/.local/bin:"* ]]; then
     pass "~/.local/bin in PATH"
   else
     warn "~/.local/bin NOT in PATH (CLI wrappers won't be found)"
-    try_fix "add ~/.local/bin to PATH" bash -c 'echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.bashrc'
+    suggest_fix "add to PATH (one-time)" "echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc && source ~/.bashrc"
   fi
 }
 
@@ -257,7 +281,6 @@ section_environment() {
 section_resources() {
   header "4. Resources"
 
-  # ── RAM ──────────────────────────────────────────────────────────────
   local mem_total mem_available mem_used mem_percent
   mem_total=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
   mem_available=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
@@ -277,27 +300,26 @@ section_resources() {
 
   if [[ ${mem_percent} -gt 90 ]]; then
     fail "Memory usage above 90%! Services may crash."
+    suggest_fix "free memory or restart services" "sudo systemctl restart owl-forward-proxy"
   elif [[ ${mem_percent} -gt 75 ]]; then
     warn "Memory usage above 75%. Monitor closely."
   else
     pass "Memory usage is healthy"
   fi
 
-  # ── Swap ─────────────────────────────────────────────────────────────
-  local swap_total swap_used swap_free
+  local swap_total swap_free
   swap_total=$(awk '/SwapTotal/ {print $2}' /proc/meminfo)
   swap_free=$(awk '/SwapFree/ {print $2}' /proc/meminfo)
-  swap_used=$((swap_total - swap_free))
   local swap_total_mb=$((swap_total / 1024))
 
   if [[ ${swap_total} -eq 0 ]]; then
     warn "No swap configured. Consider adding swap for stability."
+    suggest_fix "add 2GB swap" "sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile"
   else
     info "Swap: ${swap_total_mb}MB total, $((swap_free / 1024))MB free"
     pass "Swap is configured"
   fi
 
-  # ── Disk ─────────────────────────────────────────────────────────────
   local owl_disk_info
   owl_disk_info=$(df -h "${OWL_HOME}" 2>/dev/null | tail -1 || echo "")
   if [[ -n "${owl_disk_info}" ]]; then
@@ -317,7 +339,6 @@ section_resources() {
     fi
   fi
 
-  # ── /proc/meminfo details (verbose) ─────────────────────────────────
   if [[ "${VERBOSE}" == true ]]; then
     echo -e "\n  ${DIM}── /proc/meminfo (selected) ──${NC}"
     for key in MemTotal MemFree MemAvailable Buffers Cached SwapTotal SwapFree Shmem; do
@@ -327,7 +348,6 @@ section_resources() {
     done
   fi
 
-  # ── Process memory ───────────────────────────────────────────────────
   echo -e "\n  ${DIM}── Service Memory Usage ──${NC}"
   for svc in owl-forward-proxy kiro-gateway; do
     local pid
@@ -352,32 +372,28 @@ section_auto_tune() {
   local tune_log="${log_dir}/auto-tuner.log"
   local proxy_log="${log_dir}/forward_proxy.log"
 
-  # ── Check for auto-tuner log ─────────────────────────────────────────
   if [[ -f "${tune_log}" ]]; then
     pass "Auto-tuner log found: ${tune_log}"
 
-    # Recent adjustments
     local recent
     recent=$(tail -20 "${tune_log}" 2>/dev/null || echo "")
     if [[ -n "${recent}" ]]; then
-      info "Recent auto-tuner adjustments:"
+      info "Recent auto-tuner log lines:"
       echo "${recent}" | while IFS= read -r line; do
         echo -e "    ${DIM}${line}${NC}"
       done
     fi
 
-    # Look for specific adjustment patterns
     local adjust_count
-    adjust_count=$(rg -c "adjustment|tuned|throttle|rate_limit|circuit" "${tune_log}" 2>/dev/null || echo "0")
-    info "Total adjustments logged: ${adjust_count}"
+    adjust_count=$(search "adjustment|tuned|throttle|rate_limit|circuit" "${tune_log}")
+    info "Total adjustment-related lines: ${adjust_count}"
 
-    # Check for recent errors
     local error_count
-    error_count=$(rg -c "ERROR|CRITICAL|panic" "${tune_log}" 2>/dev/null || echo "0")
+    error_count=$(search "ERROR|CRITICAL|panic" "${tune_log}")
     if [[ ${error_count} -gt 0 ]]; then
       warn "Auto-tuner has ${error_count} error entries"
       if [[ "${VERBOSE}" == true ]]; then
-        rg "ERROR|CRITICAL|panic" "${tune_log}" 2>/dev/null | tail -5 | while IFS= read -r line; do
+        search_lines "ERROR|CRITICAL|panic" "${tune_log}" | while IFS= read -r line; do
           echo -e "    ${RED}${line}${NC}"
         done
       fi
@@ -386,17 +402,16 @@ section_auto_tune() {
     fi
   else
     warn "Auto-tuner log not found at ${tune_log}"
-    info "Auto-tuning is handled internally by proxy_defense_fixed_v3.py"
+    info "Auto-tuning is handled internally by forward_proxy.py (AutoTuner class)"
   fi
 
-  # ── Check proxy log for rate-limit events ────────────────────────────
   if [[ -f "${proxy_log}" ]]; then
     local rl_count
-    rl_count=$(rg -c "rate.limit|blocked|circuit.open|throttl" "${proxy_log}" 2>/dev/null || echo "0")
+    rl_count=$(search "rate.limit|blocked|circuit.open|throttl" "${proxy_log}")
     if [[ ${rl_count} -gt 0 ]]; then
       warn "Rate-limit/block events: ${rl_count} (check if expected)"
       if [[ "${VERBOSE}" == true ]]; then
-        rg "rate.limit|blocked|circuit.open" "${proxy_log}" 2>/dev/null | tail -5 | while IFS= read -r line; do
+        search_lines "rate.limit|blocked|circuit.open" "${proxy_log}" | while IFS= read -r line; do
           echo -e "    ${YELLOW}${line}${NC}"
         done
       fi
@@ -405,10 +420,9 @@ section_auto_tune() {
     fi
   else
     info "Proxy log not found at ${proxy_log} (may use journald instead)"
-    # Check journald
     local journal_rl
     journal_rl=$(sudo journalctl -u owl-forward-proxy --no-pager -n 100 2>/dev/null \
-                  | rg -c "rate.limit|blocked|circuit.open" 2>/dev/null || echo "0")
+                  | grep -cE "rate.limit|blocked|circuit.open" 2>/dev/null || echo "0")
     if [[ ${journal_rl} -gt 0 ]]; then
       warn "Rate-limit events in journal: ${journal_rl}"
     else
@@ -416,13 +430,12 @@ section_auto_tune() {
     fi
   fi
 
-  # ── Current auto-tune parameters ─────────────────────────────────────
   local defense_script="${OWL_HOME}/proxy_defense_fixed_v3.py"
   if [[ -f "${defense_script}" ]]; then
     local current_rpm current_burst current_block_ttl
-    current_rpm=$(rg "RATE_LIMIT_RPM.*=.*(\d+)" -o -r '$1' "${defense_script}" 2>/dev/null | tail -1 || echo "?")
-    current_burst=$(rg "RATE_BURST.*=.*(\d+)" -o -r '$1' "${defense_script}" 2>/dev/null | tail -1 || echo "?")
-    current_block_ttl=$(rg "BLOCK_TTL.*=.*(\d+)" -o -r '$1' "${defense_script}" 2>/dev/null | tail -1 || echo "?")
+    current_rpm=$(grep -oE 'RATE_LIMIT_RPM[^=]*=[^0-9]*([0-9]+)' "${defense_script}" 2>/dev/null | grep -oE '[0-9]+' | tail -1 || echo "?")
+    current_burst=$(grep -oE 'RATE_BURST[^=]*=[^0-9]*([0-9]+)' "${defense_script}" 2>/dev/null | grep -oE '[0-9]+' | tail -1 || echo "?")
+    current_block_ttl=$(grep -oE 'BLOCK_TTL[^=]*=[^0-9]*([0-9]+)' "${defense_script}" 2>/dev/null | grep -oE '[0-9]+' | tail -1 || echo "?")
     info "Current defense params: RPM=${current_rpm}, Burst=${current_burst}, BlockTTL=${current_block_ttl}s"
   else
     warn "proxy_defense_fixed_v3.py not found"
@@ -441,9 +454,7 @@ print_summary() {
     echo -e "  ${GREEN}All checks passed. No issues found.${NC}"
   else
     echo -e "  ${RED}${FAILURES} issue(s) detected.${NC}"
-    if [[ "${FIX}" != true ]]; then
-      echo -e "  ${YELLOW}Run with --fix to attempt automatic repair.${NC}"
-    fi
+    echo -e "  ${YELLOW}Review the suggested fix commands above.${NC}"
   fi
 
   echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════${NC}"
@@ -465,9 +476,6 @@ main() {
 
   if [[ "${VERBOSE}" == true ]]; then
     info "Verbose mode: ON"
-  fi
-  if [[ "${FIX}" == true ]]; then
-    info "Auto-fix mode: ON"
   fi
 
   section_service_status

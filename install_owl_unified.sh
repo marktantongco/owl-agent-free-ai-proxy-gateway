@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════
-#  OWL-AGENT v7.0 — Unified Installer
+#  OWL-AGENT v7.1 — Unified Installer
 #  Supports: Antigravity, Claude, OpenCode, Copilot, Kiro, Hermes
 # ═══════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
 # ── Version & Constants ────────────────────────────────────────────────────
-readonly VERSION="7.0.0"
+readonly VERSION="7.1.0"
 readonly OWL_HOME="${OWL_HOME:-$HOME/.owl-agent}"
 readonly OWL_CONFIG="${OWL_HOME}/config"
 readonly OWL_LOGS="${OWL_HOME}/logs"
@@ -429,349 +429,54 @@ step_4_python_venv() {
 step_5_core_scripts() {
   log_step "5" "Core Scripts"
 
-  # ── forward_proxy.py ──────────────────────────────────────────────────
-  local forward_proxy_script
-  forward_proxy_script=$(cat <<'PYEOF'
-#!/usr/bin/env python3
-"""OWL Forward Proxy — HTTP CONNECT proxy with upstream support."""
-import os
-import sys
-import asyncio
-import logging
-from typing import Optional
+  # v7.1: Copy the REAL Python files from the repo. The v7.0 installer
+  # embedded simplified stubs here that overwrote the full standalone
+  # files -- every bare-metal install produced a non-functional proxy.
+  # The stubs used non-existent aiohttp APIs (request.protocol.get_reader,
+  # request.host, request.port) and never relayed data.
+  #
+  # The installer expects to be run from a clone of the repo, so the real
+  # files are siblings of this script. If they're missing, error out.
+  local repo_dir
+  repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-try:
-    import httpx
-    import aiohttp
-    from aiohttp import web
-except ImportError:
-    print("Missing dependencies. Run: pip install httpx aiohttp aiofiles")
-    sys.exit(1)
+  local real_forward="${repo_dir}/forward_proxy.py"
+  local real_defense="${repo_dir}/proxy_defense_fixed_v3.py"
+  local real_mcp="${repo_dir}/owl_resilient_mcp.py"
+  local real_mesh="${repo_dir}/mesh_alternatives.py"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-logger = logging.getLogger("owl-forward-proxy")
+  for f in "${real_forward}" "${real_defense}" "${real_mcp}" "${real_mesh}"; do
+    if [[ ! -f "${f}" ]]; then
+      log_error "Required file not found: ${f}"
+      log_error "The installer must be run from a clone of the OWL-AGENT repo."
+      exit 1
+    fi
+  done
 
-LISTEN_HOST = os.environ.get("OWL_PROXY_HOST", "127.0.0.1")
-LISTEN_PORT = int(os.environ.get("OWL_PROXY_PORT", "60000"))
-UPSTREAM_PROXY = os.environ.get("UPSTREAM_PROXY", "")
+  if [[ "${DRY_RUN}" == true ]]; then
+    log_dry "Would copy: ${real_forward} -> ${OWL_HOME}/forward_proxy.py"
+    log_dry "Would copy: ${real_defense} -> ${OWL_HOME}/proxy_defense_fixed_v3.py"
+    log_dry "Would copy: ${real_mcp} -> ${OWL_HOME}/owl_resilient_mcp.py"
+    log_dry "Would copy: ${real_mesh} -> ${OWL_HOME}/mesh_alternatives.py"
+  else
+    backup_file "${OWL_HOME}/forward_proxy.py"
+    backup_file "${OWL_HOME}/proxy_defense_fixed_v3.py"
+    backup_file "${OWL_HOME}/owl_resilient_mcp.py"
+    backup_file "${OWL_HOME}/mesh_alternatives.py"
 
-async def handle_connect(request: web.Request) -> web.Response:
-    """Handle HTTP CONNECT tunneling."""
-    try:
-        reader = await request.protocol.get_reader()
-        writer = request.protocol.get_writer()
-        host = request.host
-        port = request.port or 443
+    cp "${real_forward}" "${OWL_HOME}/forward_proxy.py"
+    cp "${real_defense}" "${OWL_HOME}/proxy_defense_fixed_v3.py"
+    cp "${real_mcp}"    "${OWL_HOME}/owl_resilient_mcp.py"
+    cp "${real_mesh}"   "${OWL_HOME}/mesh_alternatives.py"
 
-        if UPSTREAM_PROXY:
-            upstream_host, upstream_port = UPSTREAM_PROXY.replace("http://", "").split(":")
-            upstream_port = int(upstream_port)
-            upstream_reader, upstream_writer = await asyncio.open_connection(
-                upstream_host, upstream_port
-            )
-            connect_req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n"
-            upstream_writer.write(connect_req.encode())
-            await upstream_writer.drain()
-            resp = await upstream_reader.read(4096)
-            if b"200" not in resp:
-                return web.Response(status=502, text="Upstream proxy refused CONNECT")
-            upstream_reader_local = upstream_reader
-            upstream_writer_local = upstream_writer
-        else:
-            upstream_reader_local, upstream_writer_local = await asyncio.open_connection(host, port)
+    chmod +x "${OWL_HOME}/forward_proxy.py" \
+             "${OWL_HOME}/proxy_defense_fixed_v3.py" \
+             "${OWL_HOME}/owl_resilient_mcp.py"
 
-        resp = web.Response(status=200, headers={"Connection": "keep-alive"})
-        await resp.prepare(request)
-        return resp
-    except Exception as e:
-        logger.error(f"CONNECT error for {request.host}: {e}")
-        return web.Response(status=502, text=str(e))
-
-async def handle_health(request: web.Request) -> web.Response:
-    """Health check endpoint."""
-    return web.Response(text="ok")
-
-async def start_proxy():
-    app = web.Application()
-    app.router.add_route("CONNECT", "/", handle_connect)
-    app.router.add_get("/health", handle_health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, LISTEN_HOST, LISTEN_PORT)
-    await site.start()
-    logger.info(f"OWL Forward Proxy listening on {LISTEN_HOST}:{LISTEN_PORT}")
-    if UPSTREAM_PROXY:
-        logger.info(f"Upstream proxy: {UPSTREAM_PROXY}")
-
-    # Keep running
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        await runner.cleanup()
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(start_proxy())
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
-PYEOF
-)
-  write_file "${OWL_HOME}/forward_proxy.py" "${forward_proxy_script}"
-
-  # ── proxy_defense_fixed_v3.py ──────────────────────────────────────────
-  local proxy_defense_script
-  proxy_defense_script=$(cat <<'PYEOF'
-#!/usr/bin/env python3
-"""OWL Proxy Defense v3 — Rate limiting, IP filtering, and request validation."""
-import os
-import time
-import asyncio
-import logging
-from collections import defaultdict
-from typing import Dict, Tuple
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("owl-proxy-defense")
-
-# Configuration
-RATE_LIMIT_RPM = int(os.environ.get("OWL_RATE_LIMIT_RPM", "60"))
-RATE_BURST = int(os.environ.get("OWL_RATE_BURST", "10"))
-BLOCK_TTL = int(os.environ.get("OWL_BLOCK_TTL", "300"))
-MAX_CONNECTIONS_PER_IP = int(os.environ.get("OWL_MAX_CONN_PER_IP", "20"))
-
-# State
-request_counts: Dict[str, list] = defaultdict(list)
-blocked_ips: Dict[str, float] = {}
-active_connections: Dict[str, int] = defaultdict(int)
-
-def cleanup_rate_limits():
-    """Remove expired rate limit entries."""
-    now = time.time()
-    for ip in list(request_counts.keys()):
-        request_counts[ip] = [t for t in request_counts[ip] if now - t < 60]
-        if not request_counts[ip]:
-            del request_counts[ip]
-
-def cleanup_blocks():
-    """Remove expired IP blocks."""
-    now = time.time()
-    for ip in list(blocked_ips.keys()):
-        if now - blocked_ips[ip] > BLOCK_TTL:
-            del blocked_ips[ip]
-            logger.info(f"Unblocked IP: {ip}")
-
-def is_rate_limited(ip: str) -> bool:
-    """Check if IP is rate limited."""
-    now = time.time()
-    request_counts[ip] = [t for t in request_counts[ip] if now - t < 60]
-
-    if len(request_counts[ip]) >= RATE_LIMIT_RPM:
-        return True
-
-    # Burst check (last 5 seconds)
-    burst = sum(1 for t in request_counts[ip] if now - t < 5)
-    if burst >= RATE_BURST:
-        return True
-
-    return False
-
-def check_ip(ip: str) -> Tuple[bool, str]:
-    """Comprehensive IP check. Returns (allowed, reason)."""
-    # Check block list
-    if ip in blocked_ips:
-        if time.time() - blocked_ips[ip] < BLOCK_TTL:
-            return False, "IP is blocked"
-        else:
-            del blocked_ips[ip]
-
-    # Check rate limit
-    if is_rate_limited(ip):
-        blocked_ips[ip] = time.time()
-        return False, "Rate limit exceeded"
-
-    # Check max connections
-    if active_connections.get(ip, 0) >= MAX_CONNECTIONS_PER_IP:
-        return False, "Too many concurrent connections"
-
-    return True, "OK"
-
-def record_request(ip: str):
-    """Record a request from an IP."""
-    request_counts[ip].append(time.time())
-
-def increment_connection(ip: str):
-    """Track active connection."""
-    active_connections[ip] = active_connections.get(ip, 0) + 1
-
-def decrement_connection(ip: str):
-    """Release connection tracking."""
-    if ip in active_connections:
-        active_connections[ip] = max(0, active_connections[ip] - 1)
-
-async def maintenance_loop():
-    """Periodic cleanup of stale entries."""
-    while True:
-        cleanup_rate_limits()
-        cleanup_blocks()
-        await asyncio.sleep(30)
-
-if __name__ == "__main__":
-    logger.info("Proxy Defense v3 initialized")
-    logger.info(f"Rate limit: {RATE_LIMIT_RPM} RPM, burst: {RATE_BURST}")
-    logger.info(f"Block TTL: {BLOCK_TTL}s, max connections/IP: {MAX_CONNECTIONS_PER_IP}")
-    asyncio.run(maintenance_loop())
-PYEOF
-)
-  write_file "${OWL_HOME}/proxy_defense_fixed_v3.py" "${proxy_defense_script}"
-
-  # ── owl_resilient_mcp.py ──────────────────────────────────────────────
-  local resilient_mcp_script
-  resilient_mcp_script=$(cat <<'PYEOF'
-#!/usr/bin/env python3
-"""OWL Resilient MCP — Fault-tolerant MCP server with retry and circuit breaker."""
-import os
-import sys
-import json
-import time
-import asyncio
-import logging
-from typing import Dict, Any, Optional
-from enum import Enum
-
-try:
-    import httpx
-except ImportError:
-    print("Missing httpx. Run: pip install httpx")
-    sys.exit(1)
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("owl-resilient-mcp")
-
-# ── Circuit Breaker ─────────────────────────────────────────────────────
-class CircuitState(Enum):
-    CLOSED = "closed"
-    OPEN = "open"
-    HALF_OPEN = "half_open"
-
-class CircuitBreaker:
-    def __init__(
-        self,
-        name: str,
-        failure_threshold: int = 5,
-        recovery_timeout: float = 30.0,
-        half_open_max: int = 1,
-    ):
-        self.name = name
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self.half_open_max = half_open_max
-        self.state = CircuitState.CLOSED
-        self.failure_count = 0
-        self.last_failure_time = 0.0
-        self.half_open_count = 0
-
-    def can_execute(self) -> bool:
-        if self.state == CircuitState.CLOSED:
-            return True
-        if self.state == CircuitState.OPEN:
-            if time.time() - self.last_failure_time > self.recovery_timeout:
-                self.state = CircuitState.HALF_OPEN
-                self.half_open_count = 0
-                logger.info(f"Circuit [{self.name}] -> HALF_OPEN")
-                return True
-            return False
-        if self.state == CircuitState.HALF_OPEN:
-            return self.half_open_count < self.half_open_max
-        return False
-
-    def record_success(self):
-        if self.state == CircuitState.HALF_OPEN:
-            self.state = CircuitState.CLOSED
-            logger.info(f"Circuit [{self.name}] -> CLOSED (recovered)")
-        self.failure_count = 0
-
-    def record_failure(self):
-        self.failure_count += 1
-        self.last_failure_time = time.time()
-        if self.state == CircuitState.HALF_OPEN:
-            self.state = CircuitState.OPEN
-            logger.warning(f"Circuit [{self.name}] -> OPEN (half-open failed)")
-        elif self.failure_count >= self.failure_threshold:
-            self.state = CircuitState.OPEN
-            logger.warning(f"Circuit [{self.name}] -> OPEN ({self.failure_count} failures)")
-
-# ── MCP Server ──────────────────────────────────────────────────────────
-MCP_PORT = int(os.environ.get("OWL_MCP_PORT", "8334"))
-BACKEND_URL = os.environ.get("OWL_MCP_BACKEND", "http://127.0.0.1:8333")
-RETRY_ATTEMPTS = int(os.environ.get("OWL_MCP_RETRIES", "3"))
-RETRY_DELAY = float(os.environ.get("OWL_MCP_RETRY_DELAY", "1.0"))
-
-breaker = CircuitBreaker("mcp-backend")
-
-async def call_backend(method: str, params: Dict[str, Any] = None) -> Optional[Dict]:
-    """Call backend with retry and circuit breaker."""
-    for attempt in range(1, RETRY_ATTEMPTS + 1):
-        if not breaker.can_execute():
-            logger.warning("Circuit breaker is OPEN. Skipping request.")
-            return None
-
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                payload = {"jsonrpc": "2.0", "method": method, "id": attempt}
-                if params:
-                    payload["params"] = params
-                resp = await client.post(
-                    f"{BACKEND_URL}/v1/mcp",
-                    json=payload,
-                )
-                resp.raise_for_status()
-                breaker.record_success()
-                return resp.json()
-        except Exception as e:
-            breaker.record_failure()
-            logger.error(f"Attempt {attempt}/{RETRY_ATTEMPTS} failed: {e}")
-            if attempt < RETRY_ATTEMPTS:
-                await asyncio.sleep(RETRY_DELAY * attempt)
-
-    logger.error("All retry attempts exhausted.")
-    return None
-
-async def health_check_loop():
-    """Periodic backend health check."""
-    while True:
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(f"{BACKEND_URL}/health")
-                if resp.status_code == 200:
-                    breaker.record_success()
-                else:
-                    breaker.record_failure()
-        except Exception:
-            breaker.record_failure()
-        await asyncio.sleep(15)
-
-async def main():
-    logger.info(f"OWL Resilient MCP starting on port {MCP_PORT}")
-    logger.info(f"Backend: {BACKEND_URL}, retries: {RETRY_ATTEMPTS}")
-    await health_check_loop()
-
-if __name__ == "__main__":
-    asyncio.run(main())
-PYEOF
-)
-  write_file "${OWL_HOME}/owl_resilient_mcp.py" "${resilient_mcp_script}"
-
-  # Make scripts executable
-  if [[ "${DRY_RUN}" != true ]]; then
-    chmod +x "${OWL_HOME}/forward_proxy.py"
-    chmod +x "${OWL_HOME}/proxy_defense_fixed_v3.py"
-    chmod +x "${OWL_HOME}/owl_resilient_mcp.py"
+    log_info "Copied: forward_proxy.py (v7.1)"
+    log_info "Copied: proxy_defense_fixed_v3.py (v3.3)"
+    log_info "Copied: owl_resilient_mcp.py (v1.1)"
+    log_info "Copied: mesh_alternatives.py (v1.0)"
   fi
 
   log_success "Core scripts deployed."

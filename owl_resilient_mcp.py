@@ -34,7 +34,7 @@ PROVIDERS = ["antigravity", "claude", "opencode", "copilot", "kiro", "hermes"]
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "owl-resilient-http"
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "7.1.0"
 
 MAX_RESPONSE_SIZE = 10 * 1024 * 1024  # 10 MiB
 DEFAULT_TTL = 300  # seconds
@@ -245,41 +245,30 @@ class DomainCircuitBreaker:
 
 
 class OfflineQueue:
-    """Thread-safe FIFO queue for offline/retry requests."""
+    """v7.1: Disabled. The v7.0 queue stored failed requests but never
+    retried them — items sat forever, consuming memory. v7.1 turns the
+    queue into a no-op so the MCP tool contract (queue_status) still
+    works, but enqueue() is honest about not queuing. Retry semantics
+    are deferred to v7.2.
+    """
 
     def __init__(self, max_size: int = 1000) -> None:
-        self._max = max_size
-        self._lock = threading.Lock()
-        self._queue: List[Dict[str, Any]] = []
+        pass
 
     def enqueue(self, request: Dict[str, Any]) -> bool:
-        with self._lock:
-            if len(self._queue) >= self._max:
-                return False
-            self._queue.append({**request, "_enqueued_at": time.time()})
-            return True
+        return False  # never queued
 
     def peek_all(self) -> List[Dict[str, Any]]:
-        """Return a snapshot of all items without removing them."""
-        with self._lock:
-            return list(self._queue)
+        return []
 
     def dequeue_all(self) -> List[Dict[str, Any]]:
-        with self._lock:
-            items = list(self._queue)
-            self._queue.clear()
-            return items
+        return []
 
     def size(self) -> int:
-        with self._lock:
-            return len(self._queue)
+        return 0
 
     def stats(self) -> Dict[str, Any]:
-        with self._lock:
-            return {
-                "size": len(self._queue),
-                "max_size": self._max,
-            }
+        return {"size": 0, "max_size": 0, "enabled": False}
 
 
 # ---------------------------------------------------------------------------

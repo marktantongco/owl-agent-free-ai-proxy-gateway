@@ -236,136 +236,6 @@ class TCPGossipMesh:
         logger.info("TCP Gossip mesh stopped")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ALTERNATIVE 2: REDIS PUB/SUB
-# ═══════════════════════════════════════════════════════════════════════════════
-#
-# WHY REDIS PUB/SUB?
-# - Simplest implementation — publish/subscribe is a 5-line pattern
-# - Reliable delivery (Redis buffers messages for reconnecting clients)
-# - Works everywhere Redis is reachable (LAN, cloud, VPN)
-# - Built-in AUTH and TLS support
-# - Scales to unlimited nodes
-#
-# TRADE-OFFS:
-# - Requires a Redis instance (adds ~64MB RAM)
-# - Single point of failure (Redis goes down = mesh goes down)
-#   Mitigation: Redis Sentinel or Redis Cluster for HA
-# - Slightly more complex deployment (but simpler code)
-#
-# USAGE:
-#   Set OWL_MESH_MODE=redis and OWL_REDIS_URL=redis://localhost:6379/0
-#   Or use podman-compose --profile redis-mesh up
-#
-
-class RedisPubSubMesh:
-    """
-    Redis pub/sub-based mesh for proxy health sharing.
-
-    How it works:
-    1. Subscribe to channel "owl:mesh:proxy_health"
-    2. Every 30 seconds, publish local proxy health
-    3. On receiving peer data, merge into local view
-    4. Redis handles delivery, ordering, and reconnection
-
-    Memory usage: ~2MB for the async Redis client + Redis server (~64MB)
-    """
-
-    def __init__(self, redis_url: str = os.getenv("OWL_REDIS_URL", "redis://localhost:6379/0")):
-        self.redis_url = redis_url
-        self._running = False
-        self._redis = None
-        self._pubsub = None
-        self._peer_data: Dict[str, dict] = {}
-        self._local_proxies: list = []
-        self._channel = "owl:mesh:proxy_health"
-
-    async def start(self):
-        """Connect to Redis and subscribe to mesh channel."""
-        try:
-            import aioredis
-        except ImportError:
-            # Fallback to redis.asyncio (newer package name)
-            try:
-                import redis.asyncio as aioredis
-            except ImportError:
-                logger.warning("Redis mesh requires 'aioredis' or 'redis' package. Install: pip install redis")
-                return
-
-        try:
-            self._redis = await aioredis.from_url(self.redis_url, decode_responses=True)
-            self._pubsub = self._redis.pubsub()
-            await self._pubsub.subscribe(self._channel)
-            self._running = True
-            logger.info("Redis Pub/Sub mesh connected to %s", self.redis_url)
-            asyncio.create_task(self._listener_loop())
-            asyncio.create_task(self._publish_loop())
-        except Exception as e:
-            logger.warning("Redis mesh failed to connect: %s", e)
-
-    async def _listener_loop(self):
-        """Listen for messages on the mesh channel."""
-        while self._running:
-            try:
-                message = await asyncio.wait_for(self._pubsub.get_message(
-                    ignore_subscribe_messages=True, timeout=5.0
-                ), timeout=5.0)
-                if message and message["type"] == "message":
-                    data = json.loads(message["data"])
-                    node_id = data.get("node_id", "unknown")
-                    self._peer_data[node_id] = {
-                        "data": data.get("proxies", []),
-                        "timestamp": time.time(),
-                    }
-                    logger.debug("Redis mesh recv from %s: %d proxies", node_id, len(data.get("proxies", [])))
-            except asyncio.TimeoutError:
-                continue
-            except Exception as e:
-                logger.debug("Redis listener error: %s", e)
-                await asyncio.sleep(1)
-
-    async def _publish_loop(self):
-        """Periodically publish local proxy health."""
-        while self._running:
-            await asyncio.sleep(30)
-            if self._redis and self._local_proxies:
-                msg = json.dumps({
-                    "type": "proxy_health",
-                    "node_id": MESH_NODE_ID,
-                    "timestamp": time.time(),
-                    "proxies": self._local_proxies[:20],
-                })
-                try:
-                    await self._redis.publish(self._channel, msg)
-                except Exception as e:
-                    logger.debug("Redis publish failed: %s", e)
-
-    async def broadcast(self, proxies: list):
-        """Update local proxy data."""
-        self._local_proxies = [
-            {"url": p.url, "healthy": p.healthy, "latency_ms": round(p.latency_ms, 1)}
-            for p in proxies[:20]
-        ]
-
-    def get_peer_data(self) -> Dict[str, dict]:
-        return dict(self._peer_data)
-
-    async def stop(self):
-        """Gracefully stop the Redis pub/sub mesh."""
-        self._running = False
-        if self._pubsub:
-            try:
-                await self._pubsub.unsubscribe(self._channel)
-                await self._pubsub.close()
-            except Exception:
-                pass
-        if self._redis:
-            try:
-                await self._redis.close()
-            except Exception:
-                pass
-        logger.info("Redis mesh stopped")
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FACTORY: Choose mesh implementation based on OWL_MESH_MODE
@@ -375,6 +245,9 @@ def create_mesh(mode: str = MESH_MODE):
     """
     Factory function to create the appropriate mesh implementation.
 
+    v7.1: Redis path deleted (was dead code; added a Redis dependency the
+    installer didn't actually install). UDP and TCP paths remain.
+
     Usage in forward_proxy.py:
         from mesh_alternatives import create_mesh
         mesh = create_mesh()  # reads OWL_MESH_MODE env var
@@ -383,9 +256,6 @@ def create_mesh(mode: str = MESH_MODE):
     if mode == "tcp":
         logger.info("Using TCP Gossip mesh")
         return TCPGossipMesh()
-    elif mode == "redis":
-        logger.info("Using Redis Pub/Sub mesh")
-        return RedisPubSubMesh()
     else:
         # Default: use the original UDP multicast MeshSync from forward_proxy.py
         logger.info("Using UDP Multicast mesh (default)")
