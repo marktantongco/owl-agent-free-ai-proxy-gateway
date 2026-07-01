@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OWL-AGENT v7.1 — AI free-tier aggregator with mesh health sync</title>
+<meta name="description" content="OWL-AGENT v7.1: a local-first aggregator for the free tiers of 6 AI providers (Antigravity, Claude, OpenCode, Copilot, Kiro, Hermes) with SSRF allowlist, predictive circuit breaker, and UDP mesh health broadcast. Podman-native, rootless, 8GB RAM optimized.">
+<meta name="keywords" content="ai proxy, free ai, proxy gateway, antigravity, claude, opencode, copilot, kiro, hermes, podman, mcp, circuit breaker, linux, ubuntu, open source, python, bash, container, mesh, ai aggregator">
+
+<meta property="og:type" content="website">
+<meta property="og:title" content="OWL-AGENT v7.1 — AI free-tier aggregator with mesh health sync">
+<meta property="og:description" content="Local-first aggregator for 6 AI providers. SSRF allowlist, predictive circuit breaker, UDP mesh health broadcast. Podman-native, rootless.">
+<meta property="og:url" content="https://marktantongco.github.io/owl-agent-free-ai-proxy-gateway/">
+<meta property="og:site_name" content="OWL-AGENT">
+
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="OWL-AGENT v7.1 — AI free-tier aggregator with mesh health sync">
+<meta name="twitter:description" content="Local-first aggregator for 6 AI providers. SSRF allowlist, predictive circuit breaker, UDP mesh health broadcast.">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "OWL-AGENT",
+  "version": "7.1",
+  "description": "AI free-tier aggregator with mesh health sync. Local-first aggregator for 6 AI providers with SSRF allowlist, predictive circuit breaker, and UDP mesh health broadcast.",
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": "Linux",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+  "license": "https://opensource.org/licenses/MIT",
+  "codeRepository": "https://github.com/marktantongco/owl-agent-free-ai-proxy-gateway"
+}
+</script>
+
+<style>
+  :root {
+    --bg: #0a0e14;
+    --fg: #e6edf3;
+    --muted: #8b949e;
+    --accent: #BFFF00;
+    --accent2: #00F0FF;
+    --accent3: #8B5CF6;
+    --border: #21262d;
+    --card: #161b22;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    line-height: 1.6;
+    min-height: 100vh;
+  }
+  .container { max-width: 960px; margin: 0 auto; padding: 2rem 1.5rem; }
+  header { text-align: center; padding: 4rem 1.5rem 3rem; border-bottom: 1px solid var(--border); }
+  h1 { font-size: clamp(2.5rem, 6vw, 4rem); font-weight: 800; letter-spacing: -0.02em; margin-bottom: 1rem; }
+  h1 .v { color: var(--accent); }
+  .tagline { font-size: 1.25rem; color: var(--muted); max-width: 640px; margin: 0 auto 2rem; }
+  .tagline strong { color: var(--accent2); font-weight: 600; }
+  .badges { display: flex; gap: 0.5rem; justify-content: center; flex-wrap: wrap; margin-bottom: 2rem; }
+  .badge { padding: 0.25rem 0.75rem; border: 1px solid var(--border); border-radius: 9999px; font-size: 0.875rem; color: var(--muted); }
+  .badge.green { border-color: var(--accent); color: var(--accent); }
+  .cta { display: inline-block; padding: 0.75rem 1.5rem; background: var(--accent); color: var(--bg); text-decoration: none; font-weight: 600; border-radius: 6px; margin: 0.5rem; }
+  .cta.secondary { background: transparent; color: var(--fg); border: 1px solid var(--border); }
+  section { padding: 3rem 0; border-bottom: 1px solid var(--border); }
+  h2 { font-size: 1.875rem; margin-bottom: 1rem; letter-spacing: -0.01em; }
+  h2 .n { color: var(--accent3); font-family: 'Courier New', monospace; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1.5rem; margin-top: 1.5rem; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; }
+  .card h3 { color: var(--accent2); margin-bottom: 0.5rem; font-size: 1.125rem; }
+  .card p { color: var(--muted); font-size: 0.95rem; }
+  code { background: var(--card); padding: 0.125rem 0.375rem; border-radius: 3px; font-size: 0.875em; color: var(--accent); }
+  pre { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 1rem; overflow-x: auto; margin: 1rem 0; font-size: 0.875rem; }
+  pre code { background: transparent; padding: 0; color: var(--fg); }
+  .providers { display: flex; gap: 0.5rem; flex-wrap: wrap; margin: 1rem 0; }
+  .provider { padding: 0.375rem 0.875rem; background: var(--card); border: 1px solid var(--border); border-radius: 6px; font-size: 0.875rem; color: var(--fg); }
+  .deprecation { background: rgba(255, 0, 0, 0.05); border: 1px solid rgba(255, 0, 0, 0.3); border-radius: 8px; padding: 1rem 1.5rem; margin: 1.5rem 0; color: #ffa198; }
+  footer { text-align: center; padding: 2rem 1.5rem; color: var(--muted); font-size: 0.875rem; }
+  a { color: var(--accent2); }
+</style>
+</head>
+<body>
+  <header>
+    <div class="badges">
+      <span class="badge green">v7.1 stable</span>
+      <span class="badge">MIT</span>
+      <span class="badge">Podman rootless</span>
+      <span class="badge">8GB RAM optimized</span>
+    </div>
+    <h1>OWL-AGENT <span class="v">v7.1</span></h1>
+    <p class="tagline">
+      AI free-tier aggregator with <strong>mesh health sync</strong>.
+      Not a proxy — the proxy is implementation detail. The value is the mesh.
+    </p>
+    <div>
+      <a class="cta" href="https://github.com/marktantongco/owl-agent-free-ai-proxy-gateway">View on GitHub</a>
+      <a class="cta secondary" href="https://github.com/marktantongco/owl-agent-free-ai-proxy-gateway/blob/main/KNOWN_ISSUES.md">v7.0 → v7.1 changelog</a>
+    </div>
+  </header>
+
+  <div class="container">
+    <section>
+      <h2><span class="n">01.</span> What it is</h2>
+      <p>
+        A local-first aggregator for the free tiers of six AI providers.
+        It sits between your tools (CLI agents, IDE plugins, MCP clients)
+        and the upstream providers, applying an SSRF allowlist, a
+        predictive circuit breaker, and UDP mesh health broadcast.
+      </p>
+      <div class="providers">
+        <span class="provider">Antigravity</span>
+        <span class="provider">Claude</span>
+        <span class="provider">OpenCode</span>
+        <span class="provider">Copilot</span>
+        <span class="provider">Kiro</span>
+        <span class="provider">Hermes</span>
+      </div>
+    </section>
+
+    <section>
+      <h2><span class="n">02.</span> What it isn't</h2>
+      <div class="grid">
+        <div class="card">
+          <h3>Not a cache</h3>
+          <p>v7.0 had a ProxyCache that was never wired up and was a cache-poisoning risk. v7.1 deleted it. Caching is opt-in, planned for v7.2.</p>
+        </div>
+        <div class="card">
+          <h3>Not a load balancer</h3>
+          <p>The mesh broadcasts health; it does not route. To share load across N OWL instances, put HAProxy or nginx in front.</p>
+        </div>
+        <div class="card">
+          <h3>Not an open proxy</h3>
+          <p>Default bind is 127.0.0.1. To bind 0.0.0.0 you MUST set OWL_PROXY_TOKEN — requests without bearer auth get 407.</p>
+        </div>
+        <div class="card">
+          <h3>Not a retry queue</h3>
+          <p>v7.0 had an OfflineQueue that stored failed requests forever and never retried them. v7.1 turned it into a no-op. Retry deferred to v7.2.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2><span class="n">03.</span> Quickstart</h2>
+      <p>Bare-metal (Ubuntu 22.04+, 8 GB RAM):</p>
+      <pre><code>git clone https://github.com/marktantongco/owl-agent-free-ai-proxy-gateway.git
+cd owl-agent-free-ai-proxy-gateway
+bash install_owl_unified.sh
+
+# verify
+curl http://127.0.0.1:60000/health
+# {"status":"ok","version":"7.1.0","max_connections":5,...}</code></pre>
+
+      <p>Podman (rootless):</p>
+      <pre><code>podman build -t owl-agent:7.1 .
+podman run -d --name owl-proxy -p 60000:60000 owl-agent:7.1</code></pre>
+
+      <p>With mesh + auth (binds 0.0.0.0, requires token):</p>
+      <pre><code>podman run -d --name owl-full \
+  -p 60000:60000 -p 42100:42100/udp \
+  -e OWL_PROXY_HOST=0.0.0.0 \
+  -e OWL_PROXY_TOKEN=$(openssl rand -hex 32) \
+  -e OWL_ENABLE_MESH=true \
+  owl-agent:7.1</code></pre>
+    </section>
+
+    <section>
+      <h2><span class="n">04.</span> Three things that matter</h2>
+      <div class="grid">
+        <div class="card">
+          <h3>SSRF allowlist</h3>
+          <p>Only the 6 provider domains (plus any you add via OWL_ALLOW_EXTRA) are reachable. Loopback, link-local, RFC1918, cloud-metadata — all rejected before any TCP connection is opened. DNS-rebinding defense: hostname is resolved, IP is re-checked against the safe-IP filter before connect.</p>
+        </div>
+        <div class="card">
+          <h3>Predictive circuit breaker</h3>
+          <p>Per-domain latency tracking. After 5 samples establish a p50 baseline, if the last 3 requests all exceed 2× p50, the circuit opens PREDICTIVELY — before the 5th failure. Your client fails fast (503) instead of queuing behind a slow upstream.</p>
+        </div>
+        <div class="card">
+          <h3>Mesh health broadcast</h3>
+          <p>UDP multicast (239.255.255.250:42100) every 30s. Other OWL instances on the LAN observe this node's capacity. Honest scope: observability broadcast, NOT load balancing. For cloud, switch to TCP gossip via OWL_MESH_MODE=tcp.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2><span class="n">05.</span> What changed from v7.0</h2>
+      <div class="deprecation">
+        <strong>v7.0 is deprecated.</strong> It shipped with 24 P0 bugs including SSRF,
+        cache poisoning, and a broken installer that wrote stubs over the real Python
+        files. The <code>v7.0-deprecated</code> git tag points at the broken commit for
+        forensics. See <a href="https://github.com/marktantongco/owl-agent-free-ai-proxy-gateway/blob/main/KNOWN_ISSUES.md">KNOWN_ISSUES.md</a>
+        for the full list.
+      </div>
+      <div class="grid">
+        <div class="card">
+          <h3>Security (4 fixed)</h3>
+          <p>SSRF allowlist added. Cache poisoning eliminated by deleting the cache. Auth required for non-loopback. iptables-save redirect fixed.</p>
+        </div>
+        <div class="card">
+          <h3>Dead code (6 deleted)</h3>
+          <p>ProxyCache, get_peer_proxies, PROVIDERS dict, RedisPubSubMesh, --fix mode, OfflineQueue — all gone or neutralized.</p>
+        </div>
+        <div class="card">
+          <h3>Broken install (5 fixed)</h3>
+          <p>Embedded stubs deleted. Installer now cp's the real 1000-line files from the repo. v7.0 wrote 30-line broken stubs.</p>
+        </div>
+        <div class="card">
+          <h3>Race conditions (3 fixed)</h3>
+          <p>Semaphore no longer recreated. AutoTuner is observability-only. MeshSync uses DatagramTransport.</p>
+        </div>
+        <div class="card">
+          <h3>Container (3 fixed)</h3>
+          <p>Multi-stage build (no build-essential in runtime). Redis service deleted. Health check uses /health.</p>
+        </div>
+        <div class="card">
+          <h3>Reframe</h3>
+          <p>It's no longer a "proxy". It's an AI free-tier aggregator with mesh health sync. The proxy is implementation detail. The mesh is the product.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2><span class="n">06.</span> Long-term strategy</h2>
+      <p>
+        The proxy is a commodity. Squid, mitmproxy, TinyProxy all do proxying
+        better. What none of them have is:
+      </p>
+      <ul style="margin: 1rem 0; padding-left: 1.5rem; color: var(--muted);">
+        <li><strong style="color: var(--fg);">AI-provider awareness</strong> — the allowlist is the AI provider set, not a generic URL filter.</li>
+        <li><strong style="color: var(--fg);">Mesh health broadcast</strong> — N instances observe each other's capacity for free, no broker.</li>
+        <li><strong style="color: var(--fg);">Predictive circuit breaking</strong> — opens before the upstream falls over, not after.</li>
+      </ul>
+      <p>
+        If v7.1 is "an AI proxy with a mesh", v7.2 should be "the mesh, with
+        a proxy attached". The product is the mesh.
+      </p>
+    </section>
+  </div>
+
+  <footer>
+    <p>OWL-AGENT v7.1 · MIT License · <a href="https://github.com/marktantongco/owl-agent-free-ai-proxy-gateway">GitHub</a> · <a href="https://github.com/marktantongco/owl-agent-free-ai-proxy-gateway/issues">Issues</a></p>
+  </footer>
+</body>
+</html>
