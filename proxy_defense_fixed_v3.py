@@ -56,6 +56,11 @@ from urllib.parse import urlparse
 
 import httpx
 
+# v7.2 monolith split — circuit breaker now lives in circuit.py.
+# Re-exported here so existing `from proxy_defense_fixed_v3 import CircuitBreaker`
+# imports keep working. See circuit.py for the implementation.
+from circuit import CircuitBreaker, CircuitState  # noqa: F401 (re-exported)
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Constants & Provider Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -531,76 +536,10 @@ class ProxyPoolLoader:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CircuitBreaker — per-domain circuit breaker
+# CircuitBreaker — extracted to circuit.py in v7.2 monolith split.
+# Import: `from circuit import CircuitBreaker, CircuitState`
+# (also re-exported at the top of this file for backward compatibility)
 # ═══════════════════════════════════════════════════════════════════════════════
-
-class CircuitState(Enum):
-    """Possible states of a circuit breaker."""
-    CLOSED = auto()
-    OPEN = auto()
-    HALF_OPEN = auto()
-
-
-class CircuitBreaker:
-    """
-    Per-domain circuit breaker.
-
-    * **CLOSED**  — requests flow normally; failures are counted.
-    * **OPEN**    — requests are rejected immediately; after
-      ``recovery_timeout`` the breaker transitions to HALF_OPEN.
-    * **HALF_OPEN** — a single probe request is allowed; if it succeeds the
-      breaker goes CLOSED, otherwise it re-opens.
-    """
-
-    def __init__(
-        self,
-        failure_threshold: int = CIRCUIT_FAILURE_THRESHOLD,
-        recovery_timeout: float = CIRCUIT_RECOVERY_TIMEOUT,
-    ):
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self._state = CircuitState.CLOSED
-        self._failure_count = 0
-        self._last_failure_time = 0.0
-        self._success_count = 0
-
-    @property
-    def state(self) -> CircuitState:
-        """Current state, automatically transitioning OPEN → HALF_OPEN on timeout."""
-        if self._state == CircuitState.OPEN:
-            if (time.monotonic() - self._last_failure_time) >= self.recovery_timeout:
-                self._state = CircuitState.HALF_OPEN
-        return self._state
-
-    def record_failure(self) -> CircuitState:
-        """Record a failure.  Returns the new state."""
-        self._failure_count += 1
-        self._last_failure_time = time.monotonic()
-
-        if self._state == CircuitState.HALF_OPEN:
-            # Probe failed — re-open immediately
-            self._state = CircuitState.OPEN
-            logger.info("Circuit breaker probe failed — re-opened")
-        elif self._failure_count >= self.failure_threshold:
-            self._state = CircuitState.OPEN
-            logger.info(
-                "Circuit breaker opened after %d failures", self._failure_count
-            )
-
-        return self._state
-
-    def record_success(self) -> CircuitState:
-        """Record a success.  Returns the new state."""
-        self._success_count += 1
-        self._failure_count = 0
-        if self._state == CircuitState.HALF_OPEN:
-            self._state = CircuitState.CLOSED
-            logger.info("Circuit breaker probe succeeded — closed")
-        return self._state
-
-    def is_available(self) -> bool:
-        """True if the circuit allows a request (CLOSED or HALF_OPEN)."""
-        return self.state != CircuitState.OPEN
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
