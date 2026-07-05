@@ -3,18 +3,18 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>OWL-AGENT v7.1 — AI free-tier aggregator with mesh health sync</title>
-<meta name="description" content="OWL-AGENT v7.1: a local-first aggregator for the free tiers of 6 AI providers (Antigravity, Claude, OpenCode, Copilot, Kiro, Hermes) with SSRF allowlist, predictive circuit breaker, and UDP mesh health broadcast. Podman-native, rootless, 8GB RAM optimized.">
+<title>OWL-AGENT v7.1.1 — AI free-tier aggregator with mesh health sync</title>
+<meta name="description" content="OWL-AGENT v7.1.1: a local-first aggregator for the free tiers of 6 AI providers (Antigravity, Claude, OpenCode, Copilot, Kiro, Hermes) with SSRF allowlist, predictive circuit breaker, and UDP mesh health broadcast. Podman-native, rootless, 8GB RAM optimized.">
 <meta name="keywords" content="ai proxy, free ai, proxy gateway, antigravity, claude, opencode, copilot, kiro, hermes, podman, mcp, circuit breaker, linux, ubuntu, open source, python, bash, container, mesh, ai aggregator">
 
 <meta property="og:type" content="website">
-<meta property="og:title" content="OWL-AGENT v7.1 — AI free-tier aggregator with mesh health sync">
+<meta property="og:title" content="OWL-AGENT v7.1.1 — AI free-tier aggregator with mesh health sync">
 <meta property="og:description" content="Local-first aggregator for 6 AI providers. SSRF allowlist, predictive circuit breaker, UDP mesh health broadcast. Podman-native, rootless.">
 <meta property="og:url" content="https://marktantongco.github.io/owl-agent-free-ai-proxy-gateway/">
 <meta property="og:site_name" content="OWL-AGENT">
 
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="OWL-AGENT v7.1 — AI free-tier aggregator with mesh health sync">
+<meta name="twitter:title" content="OWL-AGENT v7.1.1 — AI free-tier aggregator with mesh health sync">
 <meta name="twitter:description" content="Local-first aggregator for 6 AI providers. SSRF allowlist, predictive circuit breaker, UDP mesh health broadcast.">
 
 <script type="application/ld+json">
@@ -22,7 +22,7 @@
   "@context": "https://schema.org",
   "@type": "SoftwareApplication",
   "name": "OWL-AGENT",
-  "version": "7.1",
+  "version": "7.1.1",
   "description": "AI free-tier aggregator with mesh health sync. Local-first aggregator for 6 AI providers with SSRF allowlist, predictive circuit breaker, and UDP mesh health broadcast.",
   "applicationCategory": "DeveloperApplication",
   "operatingSystem": "Linux",
@@ -82,23 +82,38 @@
 <body>
   <header>
     <div class="badges">
-      <span class="badge green">v7.1 stable</span>
+      <span class="badge green">v7.1.1 stable</span>
       <span class="badge">MIT</span>
       <span class="badge">Podman rootless</span>
       <span class="badge">8GB RAM optimized</span>
     </div>
-    <h1>OWL-AGENT <span class="v">v7.1</span></h1>
+    <h1>OWL-AGENT <span class="v">v7.1.1</span></h1>
     <p class="tagline">
       AI free-tier aggregator with <strong>mesh health sync</strong>.
       Not a proxy — the proxy is implementation detail. The value is the mesh.
     </p>
     <div>
       <a class="cta" href="https://github.com/marktantongco/owl-agent-free-ai-proxy-gateway">View on GitHub</a>
-      <a class="cta secondary" href="https://github.com/marktantongco/owl-agent-free-ai-proxy-gateway/blob/main/KNOWN_ISSUES.md">v7.0 → v7.1 changelog</a>
+      <a class="cta secondary" href="https://github.com/marktantongco/owl-agent-free-ai-proxy-gateway/blob/main/KNOWN_ISSUES.md">v7.0 → v7.1.1 changelog</a>
     </div>
   </header>
 
   <div class="container">
+    <section>
+      <h2><span class="n">v7.1.1</span> — patch release</h2>
+      <div class="card">
+        <p>Patch release on top of v7.1. Contains 14 audit fixes in proxy_defense_fixed_v3.py (including a P0 crash on every dedup-path request), the OfflineQueue deletion from owl_resilient_mcp.py, container security guards in entrypoint.sh, and Redis removal from podman-compose.yml.</p>
+        <ul style="margin: 1rem 0; padding-left: 1.5rem; color: var(--muted);">
+          <li><code>proxy_defense_fixed_v3.py</code>: 14 audit fixes (P0-A hashlib crash + 13 P1/P2 fixes), 3 regression tests added</li>
+          <li><code>owl_resilient_mcp.py</code>: OfflineQueue no-op stub deleted (25 lines), 4 dead call sites removed</li>
+          <li><code>entrypoint.sh</code>: non-loopback bind now requires OWL_PROXY_TOKEN; default OWL_PROXY_HOST → 127.0.0.1</li>
+          <li><code>podman-compose.yml</code>: Redis service + cache volume deleted</li>
+        </ul>
+        <p style="margin: 1rem 0;"><strong style="color: var(--fg);">24 P0 bugs fixed · 482 net lines removed (1,355 deletions / 873 insertions across 9 runtime files) · 97% slimmer package (236K vs 7.3M)</strong></p>
+        <p><a href="https://github.com/marktantongco/owl-agent-free-ai-proxy-gateway/releases/tag/v7.1.1">View v7.1.1 release notes on GitHub →</a></p>
+      </div>
+    </section>
+
     <section>
       <h2><span class="n">01.</span> What it is</h2>
       <p>
@@ -122,7 +137,7 @@
       <div class="grid">
         <div class="card">
           <h3>Not a cache</h3>
-          <p>v7.0 had a ProxyCache that was never wired up and was a cache-poisoning risk. v7.1 deleted it. Caching is opt-in, planned for v7.2.</p>
+          <p>v7.0 had a ProxyCache that was never wired up and was a cache-poisoning risk. v7.1.1 deleted it. Caching is opt-in, planned for v7.2.</p>
         </div>
         <div class="card">
           <h3>Not a load balancer</h3>
@@ -134,7 +149,7 @@
         </div>
         <div class="card">
           <h3>Not a retry queue</h3>
-          <p>v7.0 had an OfflineQueue that stored failed requests forever and never retried them. v7.1 turned it into a no-op. Retry deferred to v7.2.</p>
+          <p>v7.0 had an OfflineQueue that stored failed requests forever and never retried them. v7.1.1 turned it into a no-op. Retry deferred to v7.2.</p>
         </div>
       </div>
     </section>
@@ -230,14 +245,14 @@ podman run -d --name owl-proxy -p 60000:60000 owl-agent:7.1</code></pre>
         <li><strong style="color: var(--fg);">Predictive circuit breaking</strong> — opens before the upstream falls over, not after.</li>
       </ul>
       <p>
-        If v7.1 is "an AI proxy with a mesh", v7.2 should be "the mesh, with
+        If v7.1.1 is "an AI proxy with a mesh", v7.2 should be "the mesh, with
         a proxy attached". The product is the mesh.
       </p>
     </section>
   </div>
 
   <footer>
-    <p>OWL-AGENT v7.1 · MIT License · <a href="https://github.com/marktantongco/owl-agent-free-ai-proxy-gateway">GitHub</a> · <a href="https://github.com/marktantongco/owl-agent-free-ai-proxy-gateway/issues">Issues</a></p>
+    <p>OWL-AGENT v7.1.1 · MIT License · Updated 2026-07-05 · <a href="https://github.com/marktantongco/owl-agent-free-ai-proxy-gateway">GitHub</a> · <a href="https://github.com/marktantongco/owl-agent-free-ai-proxy-gateway/issues">Issues</a></p>
   </footer>
 </body>
 </html>
