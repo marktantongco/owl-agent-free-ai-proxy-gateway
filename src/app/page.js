@@ -6,13 +6,13 @@ export default function Home() {
         <div className="container">
           <div className="hero-owl animate-in">🦉</div>
           <h1 className="animate-in delay-1">OWL-AGENT</h1>
-          <h2 className="animate-in delay-2">Free AI Proxy Gateway — Unified Synergy Installer v7.0</h2>
+          <h2 className="animate-in delay-2">Free AI Proxy Gateway — Unified Synergy Installer v7.1.1</h2>
           <p className="hero-tagline animate-in delay-3">
             <strong>One gateway. All AI models. Zero cost.</strong><br />
             Free-tier proxy access for Antigravity, Claude, OpenCode, Copilot, Kiro &amp; Hermes
           </p>
           <div className="badges animate-in delay-3">
-            <span className="badge badge-green">v7.0</span>
+            <span className="badge badge-green">v7.1.1</span>
             <span className="badge badge-blue">Linux Ubuntu</span>
             <span className="badge badge-purple">Podman</span>
             <span className="badge badge-red">MCP Compatible</span>
@@ -27,6 +27,54 @@ export default function Home() {
             <a href="https://github.com/marktantongco/owl-agent-free-ai-proxy-gateway/wiki" className="btn btn-outline">
               📖 Documentation
             </a>
+          </div>
+        </div>
+      </section>
+
+      {/* v7.1.1 Patch Release */}
+      <section className="features">
+        <div className="container">
+          <p className="section-label">Patch Release</p>
+          <h2 className="section-title">v7.1.1 — Hardening Update</h2>
+          <div className="feature-card" style={{ maxWidth: '100%' }}>
+            <h3>🛡️ v7.1.1 patch release</h3>
+            <p style={{ marginBottom: '1rem' }}>
+              Patch release on top of v7.1. Hardens the proxy defense layer, removes a dead-code path, and tightens the container entrypoint.
+            </p>
+            <ul style={{ margin: '1rem 0', paddingLeft: '1.5rem', color: 'var(--muted)', lineHeight: 1.8 }}>
+              <li>
+                <strong style={{ color: 'var(--fg)' }}>proxy_defense hardening</strong> — 14 P0 audit fixes applied to{' '}
+                <code style={{ background: 'rgba(0,240,255,0.1)', color: 'var(--accent2)', padding: '2px 6px', borderRadius: '4px', fontSize: '0.85rem' }}>proxy_defense_fixed_v3.py</code>{' '}
+                with full regression-test coverage.
+              </li>
+              <li>
+                <strong style={{ color: 'var(--fg)' }}>OfflineQueue deletion</strong> — removed the dead{' '}
+                <code style={{ background: 'rgba(0,240,255,0.1)', color: 'var(--accent2)', padding: '2px 6px', borderRadius: '4px', fontSize: '0.85rem' }}>OfflineQueue</code>{' '}
+                class and its unused call sites; queue logic is now bounded LRU only.
+              </li>
+              <li>
+                <strong style={{ color: 'var(--fg)' }}>entrypoint security guards</strong> —{' '}
+                <code style={{ background: 'rgba(0,240,255,0.1)', color: 'var(--accent2)', padding: '2px 6px', borderRadius: '4px', fontSize: '0.85rem' }}>entrypoint.sh</code>{' '}
+                now drops to non-root, validates env vars, and fails fast on missing secrets.
+              </li>
+              <li>
+                <strong style={{ color: 'var(--fg)' }}>Redis removal from compose</strong> —{' '}
+                <code style={{ background: 'rgba(0,240,255,0.1)', color: 'var(--accent2)', padding: '2px 6px', borderRadius: '4px', fontSize: '0.85rem' }}>podman-compose.yml</code>{' '}
+                no longer boots a Redis sidecar; mesh sync uses TCP gossip by default.
+              </li>
+            </ul>
+            <p style={{ marginTop: '1rem', fontSize: '1rem' }}>
+              <strong style={{ color: 'var(--fg)' }}>24 P0 bugs fixed · 482 net lines removed · 97% slimmer package</strong>
+            </p>
+            <p style={{ marginTop: '1.25rem' }}>
+              <a
+                href="https://github.com/marktantongco/owl-agent-free-ai-proxy-gateway/releases/tag/v7.1.1"
+                className="btn btn-secondary"
+                style={{ display: 'inline-flex' }}
+              >
+                📦 View v7.1.1 release notes
+              </a>
+            </p>
           </div>
         </div>
       </section>
@@ -196,7 +244,7 @@ export default function Home() {
               </tr>
             </thead>
             <tbody>
-              <tr><td>Installer</td><td><code>install_owl_unified.sh</code></td><td>v7.0</td><td>One-command setup for all components</td></tr>
+              <tr><td>Installer</td><td><code>install_owl_unified.sh</code></td><td>v7.1.1</td><td>One-command setup for all components</td></tr>
               <tr><td>Forward Proxy</td><td><code>forward_proxy.py</code></td><td>v3.0</td><td>AutoTuner + MeshSync + Circuit Breaker</td></tr>
               <tr><td>Defense Layer</td><td><code>proxy_defense_fixed_v3.py</code></td><td>v3.3</td><td>Bounded LRU cache + elastic client</td></tr>
               <tr><td>MCP Server</td><td><code>owl_resilient_mcp.py</code></td><td>v1.1</td><td>5-tool MCP server (JSON-RPC)</td></tr>

@@ -1,7 +1,7 @@
 import './globals.css'
 
 export const metadata = {
-  title: 'OWL-AGENT — Free AI Proxy Gateway | Unified Synergy Installer v7.0',
+  title: 'OWL-AGENT — Free AI Proxy Gateway | Unified Synergy Installer v7.1.1',
   description: 'Free AI Proxy Gateway — One gateway for Antigravity, Claude, OpenCode, Copilot, Kiro & Hermes. Zero cost, open source, Podman-native. Optimized for Linux Ubuntu 8GB RAM.',
   keywords: 'AI proxy, free AI gateway, Antigravity, Claude, OpenCode, Copilot, Kiro, Hermes, proxy gateway, open source AI, Podman, Linux, Ubuntu, MCP server, circuit breaker',
   authors: [{ name: 'Mark Tantongco', url: 'https://github.com/marktantongco' }],
@@ -34,7 +34,7 @@ export default function RootLayout({ children }) {
               "@context": "https://schema.org",
               "@type": "SoftwareApplication",
               "name": "OWL-AGENT",
-              "version": "7.0",
+              "version": "7.1.1",
               "description": "Free AI Proxy Gateway — Unified Synergy Installer. One gateway for Antigravity, Claude, OpenCode, Copilot, Kiro & Hermes.",
               "url": "https://github.com/marktantongco/owl-agent-free-ai-proxy-gateway",
               "applicationCategory": "DeveloperApplication",

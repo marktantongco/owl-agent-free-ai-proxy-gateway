@@ -1,6 +1,6 @@
 {
   "name": "owl-agent-free-ai-proxy-gateway",
-  "version": "7.0.0",
+  "version": "7.1.1.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
