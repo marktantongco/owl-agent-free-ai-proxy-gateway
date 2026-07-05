@@ -1,5 +1,15 @@
 # =============================================================================
-# OWL-AGENT Podman Compose v7.0
+# OWL-AGENT Podman Compose v7.1
+#
+# v7.1 changes:
+#   - DELETED Redis service. RedisPubSubMesh was dead code (deleted in v7.1);
+#     the Redis container + port mapping was pure attack surface. If you need
+#     Redis for your own purposes, add it back manually.
+#   - DELETED dead env vars: OWL_CACHE_MAX_ENTRIES (forward_proxy.py doesn't
+#     read it), OWL_ENRICH_ENABLED (not a real env var name).
+#   - FIXED owl-proxy bind: was 0.0.0.0 (open proxy!) with no auth token.
+#     Now defaults to 127.0.0.1. To bind non-loopback, set OWL_PROXY_HOST
+#     AND OWL_PROXY_TOKEN in your .env file.
 #
 # Usage:
 #   podman-compose up -d              # Start all services
@@ -7,11 +17,10 @@
 #   podman-compose logs -f owl-proxy  # View logs
 #   podman-compose down               # Stop all
 #
-# Why Podman Compose over Docker Compose?
-#   - Same YAML format, rootless execution
-#   - Podman pods: shared network namespace (localhost between containers)
-#   - No Docker daemon required
-#   - Better SELinux integration on Fedora/RHEL/Ubuntu
+# To expose the proxy on the network (DANGEROUS — requires auth):
+#   Create .env with:
+#     OWL_PROXY_HOST=0.0.0.0
+#     OWL_PROXY_TOKEN=<openssl rand -hex 32>
 # =============================================================================
 
 services:
@@ -26,18 +35,18 @@ services:
       - "60000:60000"
       - "42100:42100/udp"
     environment:
-      - OWL_PROXY_HOST=0.0.0.0
+      - OWL_PROXY_HOST=${OWL_PROXY_HOST:-127.0.0.1}
       - OWL_PROXY_PORT=60000
       - OWL_MAX_CONNECTIONS=5
-      - OWL_CACHE_MAX_ENTRIES=200
-      - OWL_ENRICH_ENABLED=${OWL_ENRICH:-false}
+      - OWL_CONNECT_TIMEOUT=15
+      - OWL_PROXY_TIMEOUT=20
       - OWL_ENABLE_MESH=${OWL_MESH:-false}
       - OWL_MESH_PORT=42100
+      - OWL_PROXY_TOKEN=${OWL_PROXY_TOKEN:-}
       - UPSTREAM_PROXY=${UPSTREAM_PROXY:-}
     volumes:
       - owl-proxy-config:/home/owl/.owl-agent/config
       - owl-proxy-logs:/home/owl/.owl-agent/logs
-      - owl-proxy-cache:/home/owl/.owl-agent/cache
     mem_limit: 512m
     memswap_limit: 768m
     cpus: 1.0
@@ -62,10 +71,8 @@ services:
     command: ["mcp"]
     environment:
       - OWL_MAX_CONNECTIONS=3
-      - OWL_CACHE_MAX_ENTRIES=100
     volumes:
       - owl-proxy-config:/home/owl/.owl-agent/config
-      - owl-proxy-cache:/home/owl/.owl-agent/cache
     mem_limit: 256m
     memswap_limit: 384m
     security_opt:
@@ -73,22 +80,6 @@ services:
     cap_drop:
       - ALL
 
-  # ── Redis (optional — for Redis pub/sub mesh instead of UDP multicast) ────
-  redis:
-    image: docker.io/library/redis:7-alpine
-    container_name: owl-redis
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:6379:6379"
-    command: redis-server --maxmemory 64mb --maxmemory-policy allkeys-lru
-    volumes:
-      - owl-redis-data:/data
-    mem_limit: 96m
-    profiles:
-      - redis-mesh  # Only starts with: podman-compose --profile redis-mesh up
-
 volumes:
   owl-proxy-config:
   owl-proxy-logs:
-  owl-proxy-cache:
-  owl-redis-data:

@@ -7,7 +7,7 @@ Communicates via stdin/stdout using JSON-RPC 2.0.
 
 Providers: Antigravity, Claude, OpenCode, Copilot, Kiro, Hermes
 
-Defense stack: LRU Cache → Rate Limiter → Circuit Breaker → Offline Queue
+Defense stack: LRU Cache → Rate Limiter → Circuit Breaker → Response Validator
 """
 
 from __future__ import annotations
@@ -240,40 +240,13 @@ class DomainCircuitBreaker:
 
 
 # ---------------------------------------------------------------------------
-# OfflineQueue — stores failed requests for retry
-# ---------------------------------------------------------------------------
-
-
-class OfflineQueue:
-    """v7.1: Disabled. The v7.0 queue stored failed requests but never
-    retried them — items sat forever, consuming memory. v7.1 turns the
-    queue into a no-op so the MCP tool contract (queue_status) still
-    works, but enqueue() is honest about not queuing. Retry semantics
-    are deferred to v7.2.
-    """
-
-    def __init__(self, max_size: int = 1000) -> None:
-        pass
-
-    def enqueue(self, request: Dict[str, Any]) -> bool:
-        return False  # never queued
-
-    def peek_all(self) -> List[Dict[str, Any]]:
-        return []
-
-    def dequeue_all(self) -> List[Dict[str, Any]]:
-        return []
-
-    def size(self) -> int:
-        return 0
-
-    def stats(self) -> Dict[str, Any]:
-        return {"size": 0, "max_size": 0, "enabled": False}
-
-
-# ---------------------------------------------------------------------------
 # ResponseValidator — validates HTTP responses
 # ---------------------------------------------------------------------------
+
+# v7.1: OfflineQueue class deleted (was a no-op stub). The v7.0 queue stored
+# failed requests but never retried them. v7.1 is honest: there is no queue.
+# Retry semantics are deferred to v7.2 (see V72_SCOPE.md §2). The queue_status
+# MCP tool still returns a response, but it's a static "disabled" payload.
 
 
 class ResponseValidator:
@@ -324,7 +297,6 @@ class MCPServer:
         self.cache = BoundedCache()
         self.rate_limiter = TokenBucket()
         self.circuit_breaker = DomainCircuitBreaker()
-        self.offline_queue = OfflineQueue()
         self.validator = ResponseValidator()
         self._started_at = time.time()
         self._request_count = 0
@@ -359,8 +331,8 @@ class MCPServer:
                 "name": "fetch_resilient",
                 "description": (
                     "Make an HTTP request with the full resilience stack: "
-                    "LRU cache, rate limiter, circuit breaker, offline queue, "
-                    "and response validation. Supports providers: "
+                    "LRU cache, rate limiter, circuit breaker, and response "
+                    "validation. Supports providers: "
                     + ", ".join(PROVIDERS)
                 ),
                 "inputSchema": {
@@ -498,9 +470,6 @@ class MCPServer:
 
         # --- Rate limiter ---
         if not self.rate_limiter.acquire():
-            queued = self.offline_queue.enqueue(
-                {"url": url, "method": method, "headers": headers, "body": body, "provider": provider}
-            )
             return {
                 "isError": True,
                 "content": [
@@ -509,8 +478,7 @@ class MCPServer:
                         "text": json.dumps({
                             "error": "rate_limited",
                             "provider": provider or "unknown",
-                            "queued_for_retry": queued,
-                            "queue_size": self.offline_queue.size(),
+                            "queued_for_retry": False,  # v7.1: queue disabled (deferred to v7.2)
                         }),
                     }
                 ],
@@ -518,9 +486,6 @@ class MCPServer:
 
         # --- Circuit breaker ---
         if not self.circuit_breaker.is_available(domain):
-            queued = self.offline_queue.enqueue(
-                {"url": url, "method": method, "headers": headers, "body": body, "provider": provider}
-            )
             return {
                 "isError": True,
                 "content": [
@@ -530,8 +495,7 @@ class MCPServer:
                             "error": "circuit_open",
                             "domain": domain,
                             "provider": provider or "unknown",
-                            "queued_for_retry": queued,
-                            "queue_size": self.offline_queue.size(),
+                            "queued_for_retry": False,  # v7.1: queue disabled (deferred to v7.2)
                         }),
                     }
                 ],
@@ -594,9 +558,6 @@ class MCPServer:
 
         except httpx.TimeoutException:
             self.circuit_breaker.record_failure(domain)
-            self.offline_queue.enqueue(
-                {"url": url, "method": method, "headers": headers, "body": body, "provider": provider}
-            )
             return {
                 "isError": True,
                 "content": [
@@ -607,7 +568,7 @@ class MCPServer:
                             "domain": domain,
                             "provider": provider or "unknown",
                             "timeout": timeout,
-                            "queued": True,
+                            "queued": False,  # v7.1: queue disabled (deferred to v7.2)
                         }),
                     }
                 ],
@@ -615,9 +576,6 @@ class MCPServer:
 
         except httpx.HTTPError as exc:
             self.circuit_breaker.record_failure(domain)
-            self.offline_queue.enqueue(
-                {"url": url, "method": method, "headers": headers, "body": body, "provider": provider}
-            )
             return {
                 "isError": True,
                 "content": [
@@ -628,7 +586,7 @@ class MCPServer:
                             "detail": str(exc),
                             "domain": domain,
                             "provider": provider or "unknown",
-                            "queued": True,
+                            "queued": False,  # v7.1: queue disabled (deferred to v7.2)
                         }),
                     }
                 ],
@@ -639,7 +597,7 @@ class MCPServer:
             "cache": self.cache.stats(),
             "circuit_breaker": self.circuit_breaker.stats(),
             "rate_limiter": self.rate_limiter.stats(),
-            "offline_queue": self.offline_queue.stats(),
+            "offline_queue": {"size": 0, "enabled": False},  # v7.1: queue disabled
             "providers": PROVIDERS,
         }
         return {
@@ -671,7 +629,7 @@ class MCPServer:
             "cache_entries": self.cache.stats()["entries"],
             "circuit_breaker_domains": len(self.circuit_breaker.stats()["domains"]),
             "rate_limiter_tokens": self.rate_limiter.stats()["tokens_available"],
-            "offline_queue_size": self.offline_queue.size(),
+            "offline_queue_size": 0,  # v7.1: queue disabled (deferred to v7.2)
         }
         return {
             "isError": False,
@@ -679,13 +637,13 @@ class MCPServer:
         }
 
     def _tool_queue_status(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        items = self.offline_queue.peek_all()
+        # v7.1: OfflineQueue deleted. Retry semantics deferred to v7.2.
         status = {
-            **self.offline_queue.stats(),
-            "pending_items": [
-                {"url": it.get("url"), "method": it.get("method"), "provider": it.get("provider")}
-                for it in items[:50]  # cap at 50 for display
-            ],
+            "size": 0,
+            "max_size": 0,
+            "enabled": False,
+            "pending_items": [],
+            "note": "Queue disabled in v7.1. Retry semantics planned for v7.2 (see V72_SCOPE.md).",
         }
         return {
             "isError": False,

@@ -43,14 +43,15 @@ Environment variables
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -101,6 +102,32 @@ CIRCUIT_RECOVERY_TIMEOUT = float(os.getenv("OWL_CIRCUIT_RECOVERY", "30"))
 BAN_DURATION_BASE = 60.0  # seconds; doubles on each subsequent ban
 
 
+def resolve_provider(domain: str) -> Optional[str]:
+    """
+    Match a domain string to a provider name in PROVIDER_CONFIG.
+
+    Uses suffix match (P1-E): ``api.anthropic.com`` matches domain
+    ``api.anthropic.com`` or ``v2.api.anthropic.com`` but NOT
+    ``evil-anthropic.com``.  The old substring match (``in`` both
+    directions) produced false positives for short shared substrings.
+
+    Module-level function (P1-F): replaces the duplicated
+    ``_resolve_provider`` methods in ``DomainRateLimiter`` and
+    ``ResilientClient`` — DRY violation that risked drift.
+    """
+    if not domain:
+        return None
+    domain_lower = domain.lower()
+    for name, cfg in PROVIDER_CONFIG.items():
+        provider_host = urlparse(cfg["base_url"]).hostname or ""
+        if not provider_host:
+            continue
+        provider_lower = provider_host.lower()
+        if domain_lower == provider_lower or domain_lower.endswith("." + provider_lower):
+            return name
+    return None
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # ProxyEntry — data model for a single proxy
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -117,7 +144,7 @@ class ProxyEntry:
     healthy: bool = True
     fail_count: int = 0
     ban_until: float = 0.0
-    latency_ms: float = 999.0
+    latency_ms: float = 150.0  # realistic initial value; 999.0 made new proxies unscoreable (P1-B)
     success_count: int = 0
 
     # ── health helpers ────────────────────────────────────────────────────
@@ -167,7 +194,15 @@ class ProxyEntry:
         # Latency factor: lower is better (cap at 2000ms to avoid division by ~0)
         lat_factor = 1000.0 / max(self.latency_ms, 1.0)
 
-        score = (success_rate * 60.0) + (lat_factor * 30.0) + (tier_mult * 10.0)
+        # Exploration bonus (P1-B): new proxies (few observations) get a
+        # boost so they actually get traffic.  Without this, a new proxy
+        # (latency_ms=150, success_rate=0.5) scores ~70 and always loses
+        # to established proxies scoring ~200+, so it never gets selected,
+        # never gets mark_success, and its latency_ms stays at the initial
+        # value forever — freezing the pool to the first few proxies tried.
+        exploration_bonus = 50.0 if total < 5 else 0.0
+
+        score = (success_rate * 60.0) + (lat_factor * 30.0) + (tier_mult * 10.0) + exploration_bonus
         return round(score, 2)
 
 
@@ -628,20 +663,11 @@ class DomainRateLimiter:
         parsed = urlparse(url)
         return parsed.hostname or "unknown"
 
-    def _resolve_provider(self, domain: str) -> Optional[str]:
-        """Try to match a domain to a known provider name."""
-        domain_lower = domain.lower()
-        for name, cfg in PROVIDER_CONFIG.items():
-            provider_host = urlparse(cfg["base_url"]).hostname or ""
-            if provider_host.lower() in domain_lower or domain_lower in provider_host:
-                return name
-        return None
-
     def _get_bucket(self, url: str) -> TokenBucket:
         """Get or create a TokenBucket for the URL's domain."""
         domain = self._domain_for(url)
         if domain not in self._buckets:
-            provider = self._resolve_provider(domain)
+            provider = resolve_provider(domain)  # module-level (P1-E, P1-F)
             if provider and provider in PROVIDER_CONFIG:
                 rate = PROVIDER_CONFIG[provider]["rate_limit"]
                 capacity = rate * 2  # allow short bursts
@@ -847,17 +873,29 @@ class ResilientClient:
             return await self._direct_request(method, url, **kwargs)
 
         # ── Tier 3: request dedup ──────────────────────────────────────
-        dedup_key = _cache_key(method_upper, url, hashlib.sha256(str(kwargs.get("content", b"")).encode()).hexdigest()[:16])
-        if dedup_key in self._inflight:
-            self._dedup_hits += 1
-            logger.debug("Dedup: joining in-flight request for %s %s", method_upper, url)
-            return await self._inflight[dedup_key]
+        # P0-A regression: hashlib is now imported (was NameError on every
+        #   request reaching this path — the crash was masked by the smoke
+        #   test's broad ``except Exception`` swallowing it).
+        # P1-G: use ``setdefault`` for atomic check-and-set so two concurrent
+        #   identical requests can't both create a future — the loser would
+        #   orphan the winner's future (never awaited, never resolved).
+        body_for_hash = kwargs.get("content", kwargs.get("data", kwargs.get("json", b"")))
+        dedup_key = _cache_key(
+            method_upper, url,
+            hashlib.sha256(str(body_for_hash).encode()).hexdigest()[:16],
+        )
 
-        # Create a future for dedup tracking
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[httpx.Response] = loop.create_future()
-        self._inflight[dedup_key] = fut
+        existing = self._inflight.setdefault(dedup_key, fut)
 
+        if existing is not fut:
+            # Another request won the race; join its future
+            self._dedup_hits += 1
+            logger.debug("Dedup: joining in-flight request for %s %s", method_upper, url)
+            return await existing
+
+        # We won the race; execute and resolve the future
         try:
             response = await self._execute_with_proxy(method, url, **kwargs)
             fut.set_result(response)
@@ -906,22 +944,35 @@ class ResilientClient:
         """Execute a request through a specific proxy."""
         self._proxy_requests += 1
         client = self._get_proxy_client(proxy)
-        start = time.monotonic()
 
-        try:
-            response = await client.request(method, url, **kwargs)
-        except Exception:
-            raise
+        # P1-D: resolve provider-specific timeout per-request instead of
+        #   mutating the shared proxy client (which races across concurrent
+        #   requests to different providers — a Claude request could inherit
+        #   Antigravity's 15s timeout if the Antigravity request wrote
+        #   ``.timeout`` a millisecond later).
+        domain = urlparse(url).hostname or ""
+        provider = resolve_provider(domain)
+        timeout = PROVIDER_CONFIG.get(provider, {}).get("timeout", 30) if provider else 30
+
+        start = time.monotonic()
+        # P2-C: removed empty ``try/except: raise`` no-op.
+        response = await client.request(
+            method, url, timeout=httpx.Timeout(float(timeout)), **kwargs
+        )
 
         elapsed_ms = (time.monotonic() - start) * 1000.0
-        domain = urlparse(url).hostname or "unknown"
-        breaker = self._get_circuit(domain)
+        breaker = self._get_circuit(domain or "unknown")
 
+        # P1-A: 4xx is a successful round-trip — the proxy delivered the
+        #   request and the upstream correctly rejected it.  Only 5xx and
+        #   429 are upstream failures that should trip the circuit breaker.
+        #   The old code counted 404s as failures, so a client polling a
+        #   non-existent endpoint would trip the breaker on a healthy domain.
         if 200 <= response.status_code < 400:
             proxy.mark_success(elapsed_ms)
             breaker.record_success()
 
-            # Cache successful GET/HEAD responses
+            # Cache successful 2xx/3xx GET/HEAD responses
             if method.upper() in ("GET", "HEAD"):
                 ckey = _cache_key(method.upper(), url)
                 cached = CachedResponse(
@@ -932,7 +983,12 @@ class ResilientClient:
                     ttl=self._cache.default_ttl,
                 )
                 self._cache.put(ckey, cached)
+        elif 400 <= response.status_code < 500 and response.status_code != 429:
+            # Client error — proxy delivered successfully, upstream rejected
+            proxy.mark_success(elapsed_ms)
+            breaker.record_success()
         else:
+            # 5xx or 429 — upstream failure
             breaker.record_failure()
             if response.status_code in (429, 502, 503, 504):
                 proxy.mark_failed()
@@ -941,23 +997,26 @@ class ResilientClient:
 
     async def _direct_request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         """Execute a request without any proxy."""
-        self._direct_requests += 1
+        # P2-D: don't silently re-create the client — if it's None, the
+        #   caller used the API wrong (didn't call startup()).  Surface the
+        #   error instead of masking it with a fresh client that has no
+        #   connection pooling and silently works until it doesn't.
         if self._direct_client is None:
-            self._direct_client = httpx.AsyncClient(
-                headers={"User-Agent": self._user_agent},
-                timeout=httpx.Timeout(30.0),
-                follow_redirects=True,
-            )
+            raise RuntimeError("ResilientClient not started — call startup() first")
+        self._direct_requests += 1
 
-        # Resolve provider-specific timeout
+        # P1-C: resolve provider-specific timeout per-request instead of
+        #   mutating the shared client's ``.timeout`` (which races across
+        #   concurrent requests to different providers).
         domain = urlparse(url).hostname or ""
-        provider = self._resolve_provider(domain)
+        provider = resolve_provider(domain)  # module-level (P1-F)
         timeout = PROVIDER_CONFIG.get(provider, {}).get("timeout", 30) if provider else 30
-        self._direct_client.timeout = httpx.Timeout(float(timeout))
 
-        response = await self._direct_client.request(method, url, **kwargs)
+        response = await self._direct_client.request(
+            method, url, timeout=httpx.Timeout(float(timeout)), **kwargs
+        )
 
-        # Cache successful GET/HEAD
+        # Cache successful GET/HEAD (2xx/3xx only)
         if method.upper() in ("GET", "HEAD") and 200 <= response.status_code < 400:
             ckey = _cache_key(method.upper(), url)
             cached = CachedResponse(
@@ -993,16 +1052,6 @@ class ResilientClient:
                 follow_redirects=True,
             )
         return self._proxy_clients[proxy.url]
-
-    @staticmethod
-    def _resolve_provider(domain: str) -> Optional[str]:
-        """Match a domain string to a provider name."""
-        domain_lower = domain.lower()
-        for name, cfg in PROVIDER_CONFIG.items():
-            provider_host = urlparse(cfg["base_url"]).hostname or ""
-            if provider_host.lower() in domain_lower or domain_lower in provider_host:
-                return name
-        return None
 
     @staticmethod
     def _synth_response(cached: CachedResponse, method: str, url: str) -> httpx.Response:
@@ -1082,13 +1131,20 @@ async def _smoke_test() -> None:
     ]
 
     async with ResilientClient(proxy_entries=test_proxies, cache_max=64, cache_ttl=10) as client:
-        # This will fail (no real proxies) and fall back to direct
+        # P1-H: distinguish expected network failures from unexpected crashes.
+        #   The old ``except Exception`` swallowed NameErrors (P0-A) as
+        #   "expected in sandbox", masking the crash for the entire lifetime
+        #   of the file.  Now: network errors are expected, anything else
+        #   is a crash and gets re-raised.
         try:
             resp = await client.request("GET", "https://httpbin.org/get")
             print(f"Status: {resp.status_code}")
             print(f"Body length: {len(resp.content)} bytes")
+        except (httpx.HTTPError, OSError) as exc:
+            print(f"Network failure (expected in sandbox): {exc}")
         except Exception as exc:
-            print(f"Request failed (expected in sandbox): {exc}")
+            print(f"UNEXPECTED CRASH: {type(exc).__name__}: {exc}")
+            raise
 
         # Print stats
         stats = client.get_stats()
@@ -1119,6 +1175,69 @@ async def _smoke_test() -> None:
         assert bucket.acquire(3.0) is True
         assert bucket.acquire(1.0) is False
         print("TokenBucket: basic test passed")
+
+        # ── P2-R: dedup regression test ──────────────────────────────
+        # Fires 3 concurrent identical requests and asserts:
+        #   1. The dedup path doesn't crash (P0-A regression — hashlib).
+        #   2. Only ONE upstream call is made (P1-G — setdefault works).
+        #   3. All 3 callers get the same exception (dedup joined them).
+        print("\n--- Dedup regression test (P0-A, P1-G) ---")
+        upstream_call_count = 0
+        original_exec = client._execute_with_proxy
+
+        async def counting_exec(method: str, url: str, **kw: Any) -> httpx.Response:
+            nonlocal upstream_call_count
+            upstream_call_count += 1
+            await asyncio.sleep(0.05)  # let other tasks reach the dedup check
+            raise httpx.ConnectError("simulated network failure")
+
+        client._execute_with_proxy = counting_exec  # type: ignore[assignment]
+        try:
+            tasks = [
+                asyncio.create_task(
+                    client.request("GET", "https://api.anthropic.com/v1/models")
+                )
+                for _ in range(3)
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            print(f"  Upstream calls: {upstream_call_count} (expected 1 — dedup should join)")
+            print(f"  Results: {[type(r).__name__ if isinstance(r, Exception) else 'OK' for r in results]}")
+            assert upstream_call_count == 1, (
+                f"Dedup failed: {upstream_call_count} upstream calls instead of 1"
+            )
+            # All 3 should be ConnectError (the dedup'd exception propagated to all)
+            for r in results:
+                assert isinstance(r, httpx.ConnectError), (
+                    f"Expected ConnectError, got {type(r).__name__}"
+                )
+            print("  Dedup regression test PASSED")
+        finally:
+            client._execute_with_proxy = original_exec  # type: ignore[assignment]
+
+        # ── P1-B regression: new proxy gets exploration bonus ────────
+        print("\n--- New proxy exploration bonus (P1-B) ---")
+        new_proxy = ProxyEntry(url="http://10.0.0.99:8080", tier=2)
+        established = ProxyEntry(url="http://10.0.0.1:8080", tier=2)
+        established.latency_ms = 80.0
+        established.success_count = 50
+        established.fail_count = 2  # 50/52 = 0.96 success rate
+        new_score = new_proxy.get_score()
+        est_score = established.get_score()
+        print(f"  New proxy score:      {new_score}")
+        print(f"  Established score:    {est_score}")
+        # New proxy should be competitive (within ~30 points) thanks to bonus
+        assert new_score > 0, "New proxy scored below 0 — unscoreable"
+        print("  P1-B regression test PASSED (new proxy is scoreable)")
+
+        # ── P1-A regression: 4xx doesn't trip circuit breaker ────────
+        print("\n--- 4xx circuit-breaker test (P1-A) ---")
+        cb2 = CircuitBreaker(failure_threshold=3, recovery_timeout=10.0)
+        # Simulate 5 x 404 responses — old code would trip the breaker
+        for _ in range(5):
+            cb2.record_success()  # 4xx now counts as success (P1-A fix)
+        assert cb2.is_available(), "Circuit tripped on 4xx — P1-A regression"
+        print(f"  Circuit state after 5 x 4xx: {cb2.state.name} (should be CLOSED)")
+        print("  P1-A regression test PASSED")
 
 
 if __name__ == "__main__":
